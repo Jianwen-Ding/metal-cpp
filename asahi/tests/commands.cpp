@@ -253,6 +253,42 @@ TEST(pipelined_dependent_command_buffers)
     ones->release();
 }
 
+TEST(serial_dispatches_see_other_cores_writes)
+{
+    // 64 ping-pong dispatches per command buffer over 152 threadgroups, each thread reading an
+    // element another threadgroup wrote in the dispatch before: every value ends at 64 * rounds.
+    const uint32_t n = 152 * 256, shift = 28693;
+    // (fewer rounds when every dispatch is simulated)
+    const char* mode = getenv("METAL_ASAHI_MODE");
+    const int rounds = mode && !strcmp(mode, "hw") ? 8 : 1;
+    MTL::Buffer *a = t::zeros(n * 4), *b = t::zeros(n * 4);
+    auto* p = t::pipeline("memory.air", "rotate_add");
+    CHECK(p);
+    for (int r = 0; r < rounds; r++) {
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        MTL::CommandBuffer* cb = t::queue()->commandBuffer();
+        MTL::ComputeCommandEncoder* e = cb->computeCommandEncoder();
+        e->setComputePipelineState(p);
+        e->setBytes(&n, 4, 2);
+        e->setBytes(&shift, 4, 3);
+        for (int k = 0; k < 64; k++) {
+            e->setBuffer(k % 2 ? b : a, 0, 0);
+            e->setBuffer(k % 2 ? a : b, 0, 1);
+            e->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+        }
+        e->endEncoding();
+        cb->commit();
+        if (r == rounds - 1) {
+            cb->waitUntilCompleted();
+            CHECK(cb->status() == MTL::CommandBufferStatusCompleted);
+        }
+        pool->release();
+    }
+    for (uint32_t i = 0; i < n; i++) CHECK_MSG(t::data<uint32_t>(a)[i] == 64u * rounds, "a[%u] = %u", i, t::data<uint32_t>(a)[i]);
+    a->release();
+    b->release();
+}
+
 TEST(two_queues)
 {
     MTL::CommandQueue* q2 = t::device()->newCommandQueue();

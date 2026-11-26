@@ -109,3 +109,9 @@ kernel void float_atomic_sum(global const float* in, global uint* sum_bits, uint
     old = seen;
   }
 }
+
+// out[i] = in[(i + shift) % n] + 1: each thread reads another threadgroup's (another core's) element.
+kernel void rotate_add(global const uint* in, global uint* out, uint n, uint shift) {
+  uint i = get_global_id(0);
+  if (i < n) out[i] = in[(i + shift) % n] + 1;
+}

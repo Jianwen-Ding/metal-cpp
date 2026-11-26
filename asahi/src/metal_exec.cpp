@@ -347,12 +347,14 @@ static bool runBatch(MQueue* q, MCommandBuffer* cb, std::vector<ComputeCommand>&
     return false;
 }
 
-// Puts dispatches into compute commands: several launches per CDM stream, each
-// followed by a barrier word, and several commands per submission. Between
-// launches of one stream the barrier orders them without invalidating the
-// instruction cache (Apple-M2-Playground 2026-11-10-cdm-barrier-bits: bit 8
-// with 5 or 6 orders; bit 11 invalidates the i-cache); the stream ends with
-// the full barrier. Commands of a submission wait for the one before them.
+// Puts dispatches into compute commands: several launches per CDM stream and
+// several commands per submission. Between launches of a serial encoder (or
+// across a concurrent one's memory barrier) a barrier word orders them: Mesa's
+// base set 0x160 (Apple-M2-Playground 2026-11-10-cdm-barrier-bits: bit 8 with
+// 5 or 6 orders and makes the data visible on other cores; bit 11 invalidates
+// the i-cache), 3.15 instead of 3.9 us per empty dispatch than 0xff7ff;
+// concurrent launches have none (0.55 us). The stream ends with the full
+// barrier. Commands of a submission wait for the one before them.
 struct Batcher {
     MQueue* q;
     MCommandBuffer* cb;
@@ -360,16 +362,21 @@ struct Batcher {
     std::vector<ComputeCommand> cmds;
     std::vector<uint8_t> stream;
     unsigned inStream = 0;
-    static constexpr uint32_t kBetween = (3u << 29) | (0xfffffu & ~(1u << 11));
+    // METAL_ASAHI_BARRIER_BITS: the bits of the barrier between launches (ordering needs bit 8 with 5 or 6).
+    static inline const uint32_t kBetween = (3u << 29) | (getenv("METAL_ASAHI_BARRIER_BITS")
+                                                              ? (uint32_t)strtoul(getenv("METAL_ASAHI_BARRIER_BITS"), nullptr, 16) & 0xfffffu
+                                                              : 0x160u);
     static constexpr uint32_t kEnd = (3u << 29) | 0xfffffu;
 
     void word(uint32_t v)
     {
         for (int i = 0; i < 4; i++) stream.push_back((uint8_t)(v >> (8 * i)));
     }
-    void add(const std::vector<uint8_t>& launch)
+    // barrier: the launch waits for the ones before it (a serial encoder, or a memory
+    // barrier of a concurrent one); without, it may overlap them.
+    void add(const std::vector<uint8_t>& launch, bool barrier = true)
     {
-        if (inStream) word(kBetween);
+        if (inStream && barrier) word(kBetween);
         stream.insert(stream.end(), launch.begin(), launch.end());
         if (++inStream >= perCmd) close();
     }
@@ -464,7 +471,7 @@ static bool execute(MQueue* q, MCommandBuffer* cb)
                          dc.pso->fn->kernel->name.c_str(), (unsigned long long)threads);
             }
             if (!simulate) {
-                batch.add(p.launch);
+                batch.add(p.launch, barrierNext);
                 barrierNext = false;
                 break;
             }

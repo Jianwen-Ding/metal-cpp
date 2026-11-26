@@ -17,10 +17,19 @@ struct Enc {
     ~Enc() { pool->release(); }
 };
 
+static bool concurrentEnc = false;
+struct EncC {
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    MTL::CommandBuffer* cb = t::queue()->commandBuffer();
+    MTL::ComputeCommandEncoder* e =
+        concurrentEnc ? cb->computeCommandEncoder(MTL::DispatchTypeConcurrent) : cb->computeCommandEncoder();
+    ~EncC() { pool->release(); }
+};
+
 static double runOnce(MTL::ComputePipelineState* p, const std::vector<t::Arg>& args, MTL::Size grid, MTL::Size tg,
                       bool groups = false, int reps = 1, double* wall = nullptr)
 {
-    Enc E;
+    EncC E;
     for (int r = 0; r < reps; r++) {
         E.e->setComputePipelineState(p);
         for (size_t i = 0; i < args.size(); i++) {
@@ -73,12 +82,16 @@ static void benchDispatch()
     auto t0 = clk::now();
     for (int i = 0; i < N; i++) runOnce(p, {b}, MTL::Size(32, 1, 1), MTL::Size(32, 1, 1));
     printf("dispatch: 1 dispatch/command buffer round trip %.1f us\n", secs(t0) / N * 1e6);
-    for (int reps : {16, 256, 1024}) {
-        if (small && reps > 16) break;
-        double g = runOnce(p, {b}, MTL::Size(32, 1, 1), MTL::Size(32, 1, 1), false, reps, &wall);
-        printf("dispatch: %4d dispatches/command buffer: wall %.2f us/dispatch, gpu %.2f us/dispatch\n", reps,
-               wall / reps * 1e6, g / reps * 1e6);
+    for (bool conc : {false, true}) {
+        concurrentEnc = conc;
+        for (int reps : {16, 256, 1024}) {
+            if (small && reps > 16) break;
+            double g = runOnce(p, {b}, MTL::Size(32, 1, 1), MTL::Size(32, 1, 1), false, reps, &wall);
+            printf("dispatch: %4d dispatches/command buffer (%s): wall %.2f us/dispatch, gpu %.2f us/dispatch\n", reps,
+                   conc ? "concurrent" : "serial", wall / reps * 1e6, g / reps * 1e6);
+        }
     }
+    concurrentEnc = false;
     // Many command buffers in flight: committed back to back, waiting on the last only.
     for (int ncb : {16, 128}) {
         if (small && ncb > 16) break;
