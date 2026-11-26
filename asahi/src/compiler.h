@@ -39,6 +39,7 @@ struct CompiledKernel {
     std::vector<LaunchDivisor> divisors;                         // ext 7
     uint32_t perCtaHalf = ~0u, perCtaSize = 0;                   // ext 8
     uint32_t address32Half = ~0u;                                // ext 9
+    std::vector<std::pair<uint32_t, uint32_t>> launchGrid;       // ext 10 (half, kind): 0-2 grid threads, 3-5 dispatch threadgroup size
     bool checked = false;                                        // ext 2/3 (not driven yet)
     // Metal-level facts.
     int threadgroupBufferLocation = -1; // [[threadgroup(n)]] index of the dynamic threadgroup buffer

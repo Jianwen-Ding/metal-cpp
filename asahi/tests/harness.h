@@ -182,6 +182,13 @@ inline bool dispatch(MTL::ComputePipelineState* p, const std::vector<Arg>& args,
     return ok;
 }
 
+// Within its scope, verify mode does not compare the GPU's bytes with the simulator's:
+// for kernels whose results depend on the order the hardware runs atomics in.
+struct OrderDependent {
+    OrderDependent() { setenv("METAL_ASAHI_VERIFY_SKIP", "1", 1); }
+    ~OrderDependent() { unsetenv("METAL_ASAHI_VERIFY_SKIP"); }
+};
+
 inline bool near(float a, float b, float rel = 1e-5f, float abs_ = 1e-6f)
 {
     if (std::isnan(a) || std::isnan(b)) return std::isnan(a) && std::isnan(b);

@@ -77,18 +77,12 @@ std::vector<std::vector<uint8_t>> splitAIRContainer(const uint8_t* data, size_t 
         return out;
     }
     if (size >= 88 && memcmp(data, "MTLB", 4) == 0) {
-        uint64_t s3off = rd64(data + 76), s3size = rd64(data + 84);
-        if (s3off + s3size > size) {
-            error = "metallib: bitcode section out of range";
-            return out;
-        }
-        // Section 3 holds one wrapped module per entry, back to back.
-        size_t off = (size_t)s3off, end = (size_t)(s3off + s3size);
-        while (off + 20 <= end) {
-            size_t n = takeWrapped(off, end);
-            if (!n) break;
-            off += n;
-            while (off < end && (off & 3)) off++;
+        // The container's bitcode section holds one wrapped module per entry.
+        // Header layouts differ between container versions, so find the
+        // modules by their wrapper magic, each checked against its own size.
+        for (size_t off = 88; off + 20 <= size;) {
+            size_t n = rd32(data + off) == 0x0B17C0DE ? takeWrapped(off, size) : 0;
+            off += n ? n : 1;
         }
         if (out.empty()) error = "metallib: no AIR bitcode found";
         return out;
@@ -222,6 +216,11 @@ bool parseRecord(const uint8_t* p, size_t n, CompiledKernel& k)
             k.perCtaSize = w(i++);
             break;
         case 9: k.address32Half = w(i++); break;
+        case 10: {
+            uint32_t c = w(i++);
+            for (uint32_t j = 0; j < c && i + 2 <= words; j++, i += 2) k.launchGrid.push_back({w(i), w(i + 1)});
+            break;
+        }
         default: return true; // unknown extension: stop, as the format says
         }
     }

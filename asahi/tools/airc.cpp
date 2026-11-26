@@ -59,6 +59,7 @@ int main(int argc, char** argv)
             }
             if (k.threadgroupBufferLocation >= 0) printf("  threadgroup(%d): dynamic threadgroup memory\n", k.threadgroupBufferLocation);
             if (k.hiddenTgBytesHalf != ~0u) printf("  hidden threadgroup bytes at half %u\n", k.hiddenTgBytesHalf);
+            for (auto& lg : k.launchGrid) printf("  launch grid value %u at half %u\n", lg.second, lg.first);
             if (dumpDir) {
                 std::ofstream of(std::string(dumpDir) + "/" + k.name + ".bin", std::ios::binary);
                 of.write((const char*)k.code.data(), (std::streamsize)k.code.size());

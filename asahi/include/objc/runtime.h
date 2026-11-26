@@ -5,6 +5,7 @@
 #if defined(__aarch64__) && !defined(__arm64__)
 #define __arm64__ 1 // metal-cpp keys its AAPCS64 objc_msgSend path on __arm64__
 #endif
+#include <TargetConditionals.h>
 #include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus

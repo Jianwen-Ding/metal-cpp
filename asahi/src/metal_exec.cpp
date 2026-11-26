@@ -48,7 +48,7 @@ struct Upload {
 };
 
 struct Prepared {
-    ComputeCommand cmd;
+    std::vector<uint8_t> launch; // CDM Launch words (the stream around them is the batcher's)
     std::vector<uint8_t> uniforms;
     uint32_t tgBytes = 0;
     std::vector<Upload> uploads;         // arena pieces this dispatch reads (and the per-CTA region)
@@ -154,6 +154,7 @@ static bool prepare(MQueue* q, DispatchCmd& dc, Prepared& p, std::string& error)
         return false;
     }
     put32(p.uniforms, k.hiddenTgBytesHalf, p.tgBytes);
+    for (auto& lg : k.launchGrid) put32(p.uniforms, lg.first, lg.second < 3 ? dc.grid[lg.second] : lg.second < 6 ? dc.local[lg.second - 3] : 0);
     for (auto& c : k.uniformConstants) put32(p.uniforms, c.first, c.second);
     for (auto& dv : k.divisors) {
         uint32_t src = 0, v = 0;
@@ -218,8 +219,8 @@ static bool prepare(MQueue* q, DispatchCmd& dc, Prepared& p, std::string& error)
     memcpy(uw, w.data(), w.size());
     uint32_t uscOff = (uint32_t)(uscVa - dev->drm->uscBase());
 
-    // CDM control stream: Launch, Barrier, Stream terminate.
-    std::vector<uint8_t> c;
+    // CDM Launch words; the batcher puts barriers between launches and terminates the stream.
+    std::vector<uint8_t>& c = p.launch;
     auto put32c = [&](uint32_t v) {
         for (int i = 0; i < 4; i++) c.push_back((uint8_t)(v >> (8 * i)));
     };
@@ -231,18 +232,6 @@ static bool prepare(MQueue* q, DispatchCmd& dc, Prepared& p, std::string& error)
     }
     for (int d = 0; d < 3; d++) put32c(dc.grid[d]);
     for (int d = 0; d < 3; d++) put32c(dc.local[d]);
-    put32c((3u << 29) | 0xfffffu);
-    put32c(2u << 29);
-    put32c(0);
-    uint64_t cdmVa;
-    uint8_t* cp = data.alloc(c.size(), 64, cdmVa);
-    if (!cp) {
-        error = "out of upload memory";
-        return false;
-    }
-    memcpy(cp, c.data(), c.size());
-    p.cmd.cdmBase = cdmVa;
-    p.cmd.cdmEnd = cdmVa + c.size();
     return true;
 }
 
@@ -342,6 +331,63 @@ static void runBatch(MQueue* q, MCommandBuffer* cb, std::vector<ComputeCommand>&
     cmds.clear();
 }
 
+// Puts dispatches into compute commands: several launches per CDM stream, each
+// followed by a barrier word, and several commands per submission. Between
+// launches of one stream the barrier orders them without invalidating the
+// instruction cache (Apple-M2-Playground 2026-11-10-cdm-barrier-bits: bit 8
+// with 5 or 6 orders; bit 11 invalidates the i-cache); the stream ends with
+// the full barrier. Commands of a submission wait for the one before them.
+struct Batcher {
+    MQueue* q;
+    MCommandBuffer* cb;
+    double& firstStart;
+    double& lastEnd;
+    size_t maxCmds = 64, perCmd = 64;
+    std::vector<ComputeCommand> cmds;
+    std::vector<uint8_t> stream;
+    unsigned inStream = 0;
+    static constexpr uint32_t kBetween = (3u << 29) | (0xfffffu & ~(1u << 11));
+    static constexpr uint32_t kEnd = (3u << 29) | 0xfffffu;
+
+    void word(uint32_t v)
+    {
+        for (int i = 0; i < 4; i++) stream.push_back((uint8_t)(v >> (8 * i)));
+    }
+    void add(const std::vector<uint8_t>& launch)
+    {
+        if (inStream) word(kBetween);
+        stream.insert(stream.end(), launch.begin(), launch.end());
+        if (++inStream >= perCmd) close();
+    }
+    void close()
+    {
+        if (!inStream) return;
+        word(kEnd);
+        word(2u << 29); // stream terminate
+        word(0);
+        uint64_t va;
+        uint8_t* dst = q->data->alloc(stream.size(), 64, va);
+        if (!dst) {
+            failBuffer(cb, 1, "out of upload memory for the CDM stream");
+        } else {
+            memcpy(dst, stream.data(), stream.size());
+            ComputeCommand c;
+            c.cdmBase = va;
+            c.cdmEnd = va + stream.size();
+            c.barrierOnPrevious = true;
+            cmds.push_back(c);
+        }
+        stream.clear();
+        inStream = 0;
+        if (cmds.size() >= maxCmds) runBatch(q, cb, cmds, firstStart, lastEnd);
+    }
+    void flush()
+    {
+        close();
+        runBatch(q, cb, cmds, firstStart, lastEnd);
+    }
+};
+
 static bool compareVerify(DispatchCmd& dc, SimState& s)
 {
     bool ok = true;
@@ -367,10 +413,11 @@ static bool compareVerify(DispatchCmd& dc, SimState& s)
 static void execute(MQueue* q, MCommandBuffer* cb)
 {
     ExecMode mode = execMode();
-    std::vector<ComputeCommand> batch;
-    size_t maxBatch = q->dev->drm ? std::min<size_t>(q->dev->drm->info().maxCommandsPerSubmission, 64) : 1;
-    if (const char* mb = getenv("METAL_ASAHI_MAX_BATCH")) maxBatch = std::max<size_t>(1, std::min<size_t>(maxBatch, atoi(mb)));
     double firstStart = 0, lastEnd = 0;
+    Batcher batch{q, cb, firstStart, lastEnd};
+    batch.maxCmds = q->dev->drm ? std::min<size_t>(q->dev->drm->info().maxCommandsPerSubmission, 64) : 1;
+    if (const char* mb = getenv("METAL_ASAHI_MAX_BATCH")) batch.maxCmds = std::max<size_t>(1, std::min<size_t>(batch.maxCmds, atoi(mb)));
+    if (const char* pc = getenv("METAL_ASAHI_DISPATCHES_PER_COMMAND")) batch.perCmd = std::max(1, atoi(pc));
     bool barrierNext = true;
     double kStart = hostNow();
     for (Command& c : cb->commands) {
@@ -386,8 +433,7 @@ static void execute(MQueue* q, MCommandBuffer* cb)
                 failBuffer(cb, 1, err);
                 break;
             }
-            if (!p.cmd.cdmBase) break; // empty grid
-            p.cmd.barrierOnPrevious = barrierNext || !batch.empty();
+            if (p.launch.empty()) break; // empty grid
             uint64_t threads = (uint64_t)dc.grid[0] * dc.grid[1] * dc.grid[2];
             bool simulate = mode != ExecMode::Hardware && (mode == ExecMode::Simulator || threads <= simThreadLimit());
             if (mode != ExecMode::Hardware && !simulate) {
@@ -397,13 +443,12 @@ static void execute(MQueue* q, MCommandBuffer* cb)
                          dc.pso->fn->kernel->name.c_str(), (unsigned long long)threads);
             }
             if (!simulate) {
-                batch.push_back(p.cmd);
-                if (batch.size() >= maxBatch) runBatch(q, cb, batch, firstStart, lastEnd);
+                batch.add(p.launch);
                 barrierNext = false;
                 break;
             }
             // Simulated dispatches run alone, so the simulator sees the memory the GPU would.
-            runBatch(q, cb, batch, firstStart, lastEnd);
+            batch.flush();
             if (cb->error) break;
             SimState s;
             buildSim(dc, p, s);
@@ -423,14 +468,16 @@ static void execute(MQueue* q, MCommandBuffer* cb)
                     if (s.sd.regions[i].dump) memcpy(s.targets[i].first, s.sd.regions[i].out.data(), s.sd.regions[i].size);
                 break;
             }
-            batch.push_back(p.cmd);
-            runBatch(q, cb, batch, firstStart, lastEnd);
-            if (!cb->error && mode == ExecMode::Verify && !compareVerify(dc, s)) gStats[3]++;
+            batch.add(p.launch);
+            batch.flush();
+            // METAL_ASAHI_VERIFY_SKIP=1: results that depend on the order atomics happen in (still simulated first).
+            const char* skip = getenv("METAL_ASAHI_VERIFY_SKIP");
+            if (!cb->error && mode == ExecMode::Verify && !(skip && *skip == '1') && !compareVerify(dc, s)) gStats[3]++;
             barrierNext = false;
             break;
         }
         case Command::Blit: {
-            runBatch(q, cb, batch, firstStart, lastEnd);
+            batch.flush();
             BlitCmd& b = *c.blit;
             auto* dst = static_cast<MBuffer*>(b.dst.get());
             if (b.kind == BlitCmd::Copy) {
@@ -451,7 +498,7 @@ static void execute(MQueue* q, MCommandBuffer* cb)
             break;
         }
         case Command::Event: {
-            runBatch(q, cb, batch, firstStart, lastEnd);
+            batch.flush();
             auto* e = static_cast<MEvent*>(c.event->event.get());
             if (c.event->wait) {
                 std::unique_lock<std::mutex> l(e->m);
@@ -468,7 +515,7 @@ static void execute(MQueue* q, MCommandBuffer* cb)
         }
         }
     }
-    if (!cb->error) runBatch(q, cb, batch, firstStart, lastEnd);
+    if (!cb->error) batch.flush();
     double kEnd = hostNow();
     cb->kernelStart = kStart;
     cb->kernelEnd = kEnd;

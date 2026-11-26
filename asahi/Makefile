@@ -51,9 +51,13 @@ APP_LIBS     := -L$(abspath $(BUILD)) -lmetal_asahi -Wl,-rpath,$(abspath $(BUILD
 
 # Kernels: OpenCL C or LLVM IR -> AIR (.air), no MSL (tools/air-build.sh).
 KERNEL_SRCS := $(wildcard kernels/*.cl) $(wildcard kernels/*.ll)
-KERNELS     := $(patsubst kernels/%,$(BUILD)/kernels/%,$(addsuffix .air,$(basename $(KERNEL_SRCS))))
+KERNELS     := $(patsubst kernels/%,$(BUILD)/kernels/%,$(addsuffix .air,$(basename $(KERNEL_SRCS)))) $(BUILD)/kernels/basic.metallib
 
-$(BUILD)/kernels/%.air: kernels/%.cl tools/air-build.sh
+$(BUILD)/kernels/%.air: kernels/%.cl tools/air-build.sh kernels/air_kernel.h
+	@mkdir -p $(dir $@)
+	LLVM_BUILD=$(LLVM_BUILD) sh tools/air-build.sh $< $@
+
+$(BUILD)/kernels/%.metallib: kernels/%.cl tools/air-build.sh kernels/air_kernel.h
 	@mkdir -p $(dir $@)
 	LLVM_BUILD=$(LLVM_BUILD) sh tools/air-build.sh $< $@
 
@@ -68,8 +72,13 @@ $(BUILD)/tests/%: tests/%.cpp tests/harness.h $(LIB)
 	@mkdir -p $(dir $@)
 	$(CLANGXX) $(APP_CXXFLAGS) $< -o $@ $(APP_LIBS)
 
+AIRC := $(BUILD)/tools/airc
+$(AIRC): tools/airc.cpp src/compiler.cpp src/compiler.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(OPT) -std=c++20 -fno-rtti $(LLVM_CXXFLAGS) tools/airc.cpp src/compiler.cpp -o $@ $(LLVM_LIBS)
+
 kernels: $(KERNELS)
-tests: $(TESTS) $(KERNELS)
+tests: $(TESTS) $(KERNELS) $(AIRC)
 
 RUN_TESTS = KERNEL_DIR=$(abspath $(BUILD)/kernels) python3 tools/run-tests.py $(TESTS)
 

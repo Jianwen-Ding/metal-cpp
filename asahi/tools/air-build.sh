@@ -14,8 +14,9 @@ cleanup() { rm -f "$tmp/k.ll" "$tmp/air.ll"; rmdir "$tmp"; }
 trap cleanup EXIT
 case "$src" in
 *.cl)
-  "$B/clang" -x cl -cl-std=CL2.0 -target spir64 -O2 -emit-llvm -S -Xclang -finclude-default-header \
-      -cl-fast-relaxed-math "$@" "$src" -o "$tmp/k.ll"
+  # kernels/air_kernel.h stands in for OpenCL's library header.
+  "$B/clang" -x cl -cl-std=CL2.0 -target spir64 -O2 -emit-llvm -S -cl-fast-relaxed-math \
+      -I"$(dirname "$0")/../kernels" -include air_kernel.h "$@" "$src" -o "$tmp/k.ll"
   # AIR's address spaces are SPIR's (1 device, 2 constant, 3 threadgroup);
   # drop SPIR's layout, and keep only the kernels as entry points.
   grep -v -E '^target (datalayout|triple)' "$tmp/k.ll" |
@@ -26,4 +27,7 @@ case "$src" in
 esac
 # The OpenCL front end's inner copies of the kernels are dead once inlined.
 "$B/opt" -passes=globaldce -S "$tmp/air.ll" -o "$tmp/k.ll"
-"$B/llc" -mtriple=air64-apple-macosx26.0.0 -O2 -filetype=obj -air-output=air -air-buffer-per-argument "$tmp/k.ll" -o "$out"
+# out.air: one AIR object; out.metallib: a .metallib container (one module per kernel).
+kind=air
+case "$out" in *.metallib) kind=metallib ;; esac
+"$B/llc" -mtriple=air64-apple-macosx26.0.0 -O2 -filetype=obj -air-output=$kind -air-buffer-per-argument "$tmp/k.ll" -o "$out"
