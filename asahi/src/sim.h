@@ -12,7 +12,8 @@ struct SimRegion {
     uint64_t va = 0;
     const uint8_t* data = nullptr; // initial contents
     size_t size = 0;
-    bool dump = false;             // read back after the run into `out`
+    bool dump = false;             // read back after the run into `out` (the whole region)
+    uint8_t* patch = nullptr;      // else, if set: what the run changed is written here (data's layout)
     std::vector<uint8_t> out;
 };
 

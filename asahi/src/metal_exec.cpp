@@ -249,8 +249,12 @@ struct SimState {
     std::vector<std::vector<uint8_t>> before;         // snapshots of the inputs
 };
 
-static void buildSim(DispatchCmd& dc, Prepared& p, SimState& s)
+// What the simulator's run needs of memory, by mode: preflight only whether it faults or hangs (the
+// buffers as they are, nothing read back); sim its effects, applied in place (only the 4 KiB chunks
+// it changed); verify snapshots of the inputs and every output region whole, for the comparison.
+static void buildSim(DispatchCmd& dc, Prepared& p, SimState& s, ExecMode mode)
 {
+    const bool full = mode == ExecMode::Verify, apply = mode == ExecMode::Simulator;
     const CompiledKernel& k = *dc.pso->fn->kernel;
     s.sd.code = &k.code;
     for (int d = 0; d < 3; d++) {
@@ -270,26 +274,37 @@ static void buildSim(DispatchCmd& dc, Prepared& p, SimState& s)
         for (Bo* x : seen)
             if (x == bo) return;
         seen.push_back(bo);
-        s.before.emplace_back(bo->map, bo->map + size);
         SimRegion r;
         r.va = bo->va;
         r.size = size;
-        r.dump = dump;
+        r.data = bo->map;
+        if (full) {
+            s.before.emplace_back(bo->map, bo->map + size);
+            r.dump = dump;
+        } else if (apply && dump) {
+            r.patch = bo->map;
+        }
         s.sd.regions.push_back(std::move(r));
         s.targets.push_back({bo->map, size});
     };
     for (MBuffer* b : p.buffers) addBo(b->bo, (std::max<uint64_t>(b->length, 4) + 3) & ~3ull, true);
     if (p.globals) addBo(p.globals, p.globals->size, true);
     for (auto& u : p.uploads) {
-        s.before.emplace_back(u.ptr, u.ptr + u.size);
         SimRegion r;
         r.va = u.va;
         r.size = u.size;
-        r.dump = u.writable;
+        r.data = u.ptr;
+        if (full) {
+            s.before.emplace_back(u.ptr, u.ptr + u.size);
+            r.dump = u.writable;
+        } else if (apply && u.writable) {
+            r.patch = u.ptr;
+        }
         s.sd.regions.push_back(std::move(r));
         s.targets.push_back({u.ptr, u.size});
     }
-    for (size_t i = 0; i < s.sd.regions.size(); i++) s.sd.regions[i].data = s.before[i].data();
+    if (full)
+        for (size_t i = 0; i < s.sd.regions.size(); i++) s.sd.regions[i].data = s.before[i].data();
 }
 
 // ---------------------------------------------------------------- execution
@@ -480,7 +495,7 @@ static bool execute(MQueue* q, MCommandBuffer* cb)
             q->drain();
             if (cb->error) break;
             SimState s;
-            buildSim(dc, p, s);
+            buildSim(dc, p, s, mode == ExecMode::Simulator || !q->dev->drm ? ExecMode::Simulator : mode);
             gStats[1]++;
             SimResult r = masahi::simulate(s.sd);
             if (!r.ok) {

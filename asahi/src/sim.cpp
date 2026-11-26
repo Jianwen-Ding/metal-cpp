@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -47,6 +48,66 @@ static bool writeFile(const std::string& path, const void* data, size_t n)
         n -= (size_t)w;
     }
     return close(fd) == 0;
+}
+
+// Region files live in memory (memfd): the simulator opens them as /proc/self/fd/N, which
+// it inherits. Large buffers never touch the disk.
+struct MemFile {
+    int fd = -1;
+    std::string path;
+    bool create(const char* name)
+    {
+        fd = memfd_create(name, 0); // inherited by the simulator
+        if (fd < 0) return false;
+        path = "/proc/self/fd/" + std::to_string(fd);
+        return true;
+    }
+    bool write(const void* data, size_t n)
+    {
+        const uint8_t* p = (const uint8_t*)data;
+        off_t off = 0;
+        while (n) {
+            ssize_t w = pwrite(fd, p, n, off);
+            if (w <= 0) return false;
+            p += w;
+            off += w;
+            n -= (size_t)w;
+        }
+        return true;
+    }
+    bool read(std::vector<uint8_t>& out)
+    {
+        struct stat st;
+        if (fstat(fd, &st) != 0) return false;
+        out.resize((size_t)st.st_size);
+        size_t got = 0;
+        while (got < out.size()) {
+            ssize_t r = pread(fd, out.data() + got, out.size() - got, (off_t)got);
+            if (r <= 0) return false;
+            got += (size_t)r;
+        }
+        return true;
+    }
+    ~MemFile()
+    {
+        if (fd >= 0) close(fd);
+    }
+};
+
+// Applies agx_run --dump-changed records (u64 offset, u64 length, bytes) to dst.
+static bool applyChanged(const std::vector<uint8_t>& rec, uint8_t* dst, size_t size)
+{
+    size_t i = 0;
+    while (i + 16 <= rec.size()) {
+        uint64_t off, len;
+        memcpy(&off, &rec[i], 8);
+        memcpy(&len, &rec[i + 8], 8);
+        i += 16;
+        if (off > size || len > size - off || len > rec.size() - i) return false;
+        memcpy(dst + off, &rec[i], len);
+        i += len;
+    }
+    return i == rec.size();
 }
 
 static bool readFile(const std::string& path, std::vector<uint8_t>& out)
@@ -110,19 +171,23 @@ SimResult simulate(SimDispatch& d)
         writeFile(obj, d.object->data(), d.object->size());
         args.insert(args.end(), {"--lines", obj, "--lines-offset", std::to_string(d.linesOffset)});
     }
+    std::vector<MemFile> inFiles(d.regions.size()), outFiles(d.regions.size());
     for (size_t i = 0; i < d.regions.size(); i++) {
         auto& reg = d.regions[i];
-        std::string f = dir + "/r" + std::to_string(i) + ".bin";
-        files.push_back(f);
-        if (!writeFile(f, reg.data, reg.size)) {
-            r.error = "cannot write " + f;
+        if (!inFiles[i].create("metal-asahi-sim-in") || !inFiles[i].write(reg.data, reg.size)) {
+            r.error = "cannot write the simulator's memory: " + std::string(strerror(errno));
             removeTree(dir, files);
             return r;
         }
-        args.insert(args.end(), {"--map", hex(reg.va) + "=" + f});
-        if (reg.dump) {
-            files.push_back(f + ".out");
-            args.insert(args.end(), {"--dump", hex(reg.va) + "=" + std::to_string(reg.size) + ":" + f + ".out"});
+        args.insert(args.end(), {"--map", hex(reg.va) + "=" + inFiles[i].path});
+        if (reg.dump || reg.patch) {
+            if (!outFiles[i].create("metal-asahi-sim-out")) {
+                r.error = "memfd_create: " + std::string(strerror(errno));
+                removeTree(dir, files);
+                return r;
+            }
+            args.insert(args.end(), {reg.dump ? "--dump" : "--dump-changed",
+                                     hex(reg.va) + "=" + std::to_string(reg.size) + ":" + outFiles[i].path});
         }
     }
     std::string outPath = dir + "/stdout.txt";
@@ -181,11 +246,20 @@ SimResult simulate(SimDispatch& d)
     auto pos = out.find("\"instructions\":");
     if (pos != std::string::npos) r.instructions = strtoull(out.c_str() + pos + 15, nullptr, 10);
     for (size_t i = 0; i < d.regions.size(); i++) {
-        if (!d.regions[i].dump) continue;
-        if (!readFile(dir + "/r" + std::to_string(i) + ".bin.out", d.regions[i].out) || d.regions[i].out.size() != d.regions[i].size) {
-            r.error = "simulator dump missing for region " + std::to_string(i);
-            removeTree(dir, files);
-            return r;
+        auto& reg = d.regions[i];
+        if (reg.dump) {
+            if (!outFiles[i].read(reg.out) || reg.out.size() != reg.size) {
+                r.error = "simulator dump missing for region " + std::to_string(i);
+                removeTree(dir, files);
+                return r;
+            }
+        } else if (reg.patch) {
+            std::vector<uint8_t> rec;
+            if (!outFiles[i].read(rec) || !applyChanged(rec, reg.patch, reg.size)) {
+                r.error = "bad simulator change records for region " + std::to_string(i);
+                removeTree(dir, files);
+                return r;
+            }
         }
     }
     r.ok = true;
