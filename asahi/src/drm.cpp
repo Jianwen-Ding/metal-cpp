@@ -99,6 +99,49 @@ DrmDevice* DrmDevice::open(std::string& error)
     return nullptr;
 }
 
+DrmDevice* DrmDevice::openSimulated(const std::string& chip, std::string& error)
+{
+    // agx-g<generation><variant>; the core counts are the full parts' (M2 Max: 38 cores in 4 clusters)
+    unsigned gen = 0;
+    char v = 0;
+    if (sscanf(chip.c_str(), "agx-g%u%c", &gen, &v) != 2 || gen < 13 || gen > 17) {
+        error = "METAL_ASAHI_SIM_GPU: expected agx-g13g ... agx-g16x style name, got '" + chip + "'";
+        return nullptr;
+    }
+    auto* d = new DrmDevice();
+    d->simulated_ = true;
+    GpuInfo& i = d->info_;
+    i.generation = gen;
+    i.variant = (char)toupper((unsigned char)v);
+    i.revision = 0x11;
+    i.clusters = v == 'c' ? 4 : v == 'd' ? 8 : v == 's' ? 2 : 1;
+    i.cores = v == 'c' ? 38 : v == 'd' ? 76 : v == 's' ? 19 : 10;
+    i.maxKhz = 1398000;
+    i.maxCommandsPerSubmission = 64;
+    i.g14x = gen >= 14 && i.clusters > 1;
+    i.chipName = chip;
+    static const char* names[] = {"", "", "", "", "", "", "", "", "", "", "", "", "", "M1", "M2", "M3", "M4", "M5"};
+    std::string tier = v == 'g' ? "" : v == 's' ? " Pro" : v == 'c' ? " Max" : v == 'd' ? " Ultra" : "";
+    i.marketing = std::string("Apple ") + names[gen] + tier + " (AGX Performance Simulator)";
+    // The VM a G14 gives (Asahi 6.19): 4 KiB .. 2^39, the top 32 GiB the kernel's.
+    i.vmStart = 0x4000;
+    i.vmEnd = 1ull << 39;
+    d->initLayout(i.vmStart, i.vmEnd, i.vmEnd - (32ull << 30));
+    d->tsBo_ = d->alloc(kTsBytes, false);
+    d->tsFree_.push_back({1, (uint32_t)(kTsBytes / 16) - 1});
+    return d;
+}
+
+void DrmDevice::initLayout(uint64_t vmStart, uint64_t vmEnd, uint64_t kernelStart)
+{
+    uint64_t shaderBase = vmStart > (1ull << 36) ? vmStart : (1ull << 36);
+    shaderBase = (shaderBase + 0xffffffffull) & ~0xffffffffull;
+    uint64_t dataBase = shaderBase + 0x100000000ull;
+    uscBase_ = shaderBase;
+    uscHeap_.init(shaderBase + kPage, 0x100000000ull - kPage);
+    dataHeap_.init(dataBase + kPage, kernelStart - dataBase - kPage);
+}
+
 bool DrmDevice::init(int fd, std::string& error)
 {
     fd_ = fd;
@@ -176,6 +219,10 @@ bool DrmDevice::init(int fd, std::string& error)
 
 DrmDevice::~DrmDevice()
 {
+    if (simulated_) {
+        if (tsBo_) free(tsBo_);
+        return;
+    }
     if (fd_ >= 0) {
         if (vm_) {
             drm_asahi_vm_destroy vd{};
@@ -190,6 +237,25 @@ Bo* DrmDevice::alloc(uint64_t size, bool usc, bool writable)
 {
     size = (size + kPage - 1) & ~(kPage - 1);
     if (!size) size = kPage;
+    if (simulated_) {
+        void* m = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) return nullptr;
+        uint64_t align = size >= (2ull << 20) ? (2ull << 20) : kPage;
+        uint64_t va = (usc ? uscHeap_ : dataHeap_).alloc(size, align);
+        if (!va) {
+            munmap(m, size);
+            return nullptr;
+        }
+        auto* b = new Bo();
+        std::lock_guard<std::mutex> l(m_);
+        b->handle = nextHandle_++;
+        b->size = size;
+        b->usc = usc;
+        b->map = (uint8_t*)m;
+        b->va = va;
+        allocated_ += size;
+        return b;
+    }
     drm_asahi_gem_create gc{};
     gc.size = size;
     gc.flags = DRM_ASAHI_GEM_WRITEBACK;
@@ -245,6 +311,14 @@ fail:
 void DrmDevice::free(Bo* b)
 {
     if (!b) return;
+    if (simulated_) {
+        if (b->va) (b->usc ? uscHeap_ : dataHeap_).free(b->va, b->size);
+        if (b->map) munmap(b->map, b->size);
+        std::lock_guard<std::mutex> l(m_);
+        allocated_ -= b->size;
+        delete b;
+        return;
+    }
     if (b->va) {
         drm_asahi_gem_bind_op op{};
         op.flags = DRM_ASAHI_BIND_UNBIND;
@@ -271,6 +345,8 @@ void DrmDevice::free(Bo* b)
 
 uint32_t DrmDevice::createQueue(uint32_t priority)
 {
+    if (simulated_) return 1;
+
     drm_asahi_queue_create qc{};
     qc.vm_id = vm_;
     qc.priority = priority;
@@ -281,6 +357,8 @@ uint32_t DrmDevice::createQueue(uint32_t priority)
 
 void DrmDevice::destroyQueue(uint32_t q)
 {
+    if (simulated_) return;
+
     drm_asahi_queue_destroy qd{};
     qd.queue_id = q;
     xioctl(fd_, DRM_IOCTL_ASAHI_QUEUE_DESTROY, &qd);
@@ -288,6 +366,11 @@ void DrmDevice::destroyQueue(uint32_t q)
 
 uint32_t DrmDevice::createSyncobj()
 {
+    if (simulated_) {
+        std::lock_guard<std::mutex> l(m_);
+        return nextHandle_++;
+    }
+
     drm_syncobj_create sc{};
     if (xioctl(fd_, DRM_IOCTL_SYNCOBJ_CREATE, &sc) != 0) return 0;
     return sc.handle;
@@ -295,6 +378,8 @@ uint32_t DrmDevice::createSyncobj()
 
 void DrmDevice::destroySyncobj(uint32_t h)
 {
+    if (simulated_) return;
+
     drm_syncobj_destroy sd{};
     sd.handle = h;
     xioctl(fd_, DRM_IOCTL_SYNCOBJ_DESTROY, &sd);
@@ -309,6 +394,8 @@ static uint64_t monoNs()
 
 int DrmDevice::waitSyncobj(uint32_t h, uint64_t timeoutNs)
 {
+    if (simulated_) return 0;
+
     drm_syncobj_wait sw{};
     sw.handles = (uint64_t)(uintptr_t)&h;
     sw.count_handles = 1;
@@ -319,6 +406,8 @@ int DrmDevice::waitSyncobj(uint32_t h, uint64_t timeoutNs)
 
 void DrmDevice::resetSyncobj(uint32_t h)
 {
+    if (simulated_) return;
+
     drm_syncobj_array a{};
     a.handles = (uint64_t)(uintptr_t)&h;
     a.count_handles = 1;
@@ -327,6 +416,8 @@ void DrmDevice::resetSyncobj(uint32_t h)
 
 uint64_t DrmDevice::gpuTimeNs()
 {
+    if (simulated_) return monoNs();
+
     drm_asahi_get_time t{};
     if (xioctl(fd_, DRM_IOCTL_ASAHI_GET_TIME, &t) != 0) return 0;
     return t.gpu_timestamp;
@@ -366,6 +457,10 @@ bool DrmDevice::submit(uint32_t queue, const std::vector<ComputeCommand>& cmds, 
         drm_asahi_cmd_header h;
         drm_asahi_cmd_compute c;
     };
+    if (simulated_) {
+        error = "the simulated device has no GPU to submit to";
+        return false;
+    }
     static constexpr size_t kMaxCmds = 64;
     if (cmds.empty() || cmds.size() > info_.maxCommandsPerSubmission || cmds.size() > kMaxCmds) {
         error = "bad command count";

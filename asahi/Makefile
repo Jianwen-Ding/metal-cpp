@@ -6,6 +6,7 @@
 #   make check           run the test suite (METAL_ASAHI_MODE=verify: simulator first, then GPU, results compared)
 #   make check-sim       run the test suite on the simulator only (no GPU)
 #   make check-hw        run the test suite on the GPU only
+#   make check-sim-device  run the test suite with no GPU at all (the simulated device)
 
 LLVM_BUILD ?= /scratch/llvm-build
 LLVM_SRC   ?= $(abspath ../../llvm-project)
@@ -98,11 +99,15 @@ check: tests
 check-sim: tests
 	METAL_ASAHI_MODE=sim $(RUN_TESTS)
 
+# No GPU at all: the simulated device (METAL_ASAHI_DEVICE=sim), every dispatch on agx_run.
+check-sim-device: tests
+	METAL_ASAHI_DEVICE=sim METAL_ASAHI_MODE=sim $(RUN_TESTS)
+
 check-hw: tests
 	METAL_ASAHI_MODE=hw $(RUN_TESTS)
 
 clean:
 	rm -f $(BUILD)/obj/*.o $(LIB) $(TESTS) $(KERNELS)
 
-.PHONY: all bench kernels tests check check-sim check-hw clean
+.PHONY: all bench kernels tests check check-sim check-sim-device check-hw clean
 .SECONDARY:

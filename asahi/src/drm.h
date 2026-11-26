@@ -62,6 +62,10 @@ struct ComputeCommand {
 class DrmDevice {
 public:
     static DrmDevice* open(std::string& error); // the first Asahi render node
+    // No GPU: buffers are host memory at the addresses a GPU VM would give them, and
+    // every dispatch runs on the AGX Performance Simulator. chip: "agx-g14c" (M2 Max) ...
+    static DrmDevice* openSimulated(const std::string& chip, std::string& error);
+    bool simulated() const { return simulated_; }
     ~DrmDevice();
 
     const GpuInfo& info() const { return info_; }
@@ -95,7 +99,10 @@ public:
 private:
     DrmDevice() = default;
     bool init(int fd, std::string& error);
+    void initLayout(uint64_t vmStart, uint64_t vmEnd, uint64_t kernelStart);
     int fd_ = -1;
+    bool simulated_ = false;
+    uint32_t nextHandle_ = 1;
     GpuInfo info_;
     uint32_t vm_ = 0;
     uint64_t uscBase_ = 0;

@@ -64,8 +64,23 @@ it reaches the GPU. `METAL_ASAHI_MODE` selects:
 | `sim` | the simulator only (no GPU needed); its results are written into the buffers |
 | `hw` | the GPU only |
 
+### Running on the simulator alone (no GPU)
+
+`METAL_ASAHI_DEVICE=sim` gives a metal-cpp program a device that is the AGX Performance Simulator: no
+`/dev/dri` node is opened (the machine needs no Apple GPU, nor Asahi). Buffers are host memory at the GPU
+addresses a G14 VM would give them, kernels compile for the simulated chip (`METAL_ASAHI_SIM_GPU`, default
+`agx-g14c`, the M2 Max), and every dispatch runs on `agx_run` with its effects written back into the buffers
+(`MTLDevice::name()` is "Apple M2 Max (AGX Performance Simulator)"). The mode is `sim` whatever
+`METAL_ASAHI_MODE` says, and `sim` mode falls back to this device when no GPU can be opened.
+`newBufferWithBytesNoCopy` buffers are the client's memory itself. GPU times are host times (no firmware
+timestamps). `make check-sim-device` runs the test suite this way.
+
+```sh
+METAL_ASAHI_DEVICE=sim ./app      # same binary, same .air, no GPU
+```
+
 Dispatches above `METAL_ASAHI_SIM_MAX_THREADS` threads (default 4M) skip the simulator in `preflight` / `verify`.
-Other variables: `METAL_ASAHI_AGX_RUN` (simulator binary), `METAL_ASAHI_SIM_MAX_STEPS`, `METAL_ASAHI_SIM_TIMEOUT`,
+Other variables: `METAL_ASAHI_DEVICE` (`sim`: see above), `METAL_ASAHI_SIM_GPU`, `METAL_ASAHI_AGX_RUN` (simulator binary), `METAL_ASAHI_SIM_MAX_STEPS`, `METAL_ASAHI_SIM_TIMEOUT`,
 `METAL_ASAHI_DEBUG` (1 info, 2 simulator command lines, 3 every message send), `METAL_ASAHI_CPU` (AGX processor,
 default from the GPU: `agx-g14c` on M2 Max), `METAL_ASAHI_IR_PIPELINE` (default `default<O2>`),
 `METAL_ASAHI_DISPATCHES_PER_COMMAND` (default 64), `METAL_ASAHI_MAX_IN_FLIGHT` (command buffers a queue keeps on

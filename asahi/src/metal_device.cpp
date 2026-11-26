@@ -20,15 +20,28 @@
 
 namespace masahi {
 
+// METAL_ASAHI_DEVICE=sim: a device without a GPU (every dispatch runs on the simulator).
+bool simulatedDeviceRequested()
+{
+    const char* v = getenv("METAL_ASAHI_DEVICE");
+    return v && (!strcmp(v, "sim") || !strcmp(v, "simulator"));
+}
+
 ExecMode execMode()
 {
     static ExecMode m = [] {
         const char* v = getenv("METAL_ASAHI_MODE");
         std::string s = v ? v : "";
+        if (simulatedDeviceRequested() && s != "sim" && s != "simulator")
+            warn("METAL_ASAHI_DEVICE=sim has no GPU: METAL_ASAHI_MODE=%s runs as sim", s.c_str());
+        if (simulatedDeviceRequested()) return ExecMode::Simulator;
         if (s == "hw" || s == "hardware") return ExecMode::Hardware;
         if (s == "sim" || s == "simulator") return ExecMode::Simulator;
         if (s == "verify") return ExecMode::Verify;
-        if (s.empty() || s == "preflight") return ExecMode::Preflight;
+        if (s.empty() || s == "preflight") {
+            if (simulatedDeviceRequested()) return ExecMode::Simulator; // no GPU to run on
+            return ExecMode::Preflight;
+        }
         warn("unknown METAL_ASAHI_MODE '%s' (hw, sim, preflight, verify); using preflight", s.c_str());
         return ExecMode::Preflight;
     }();
@@ -75,7 +88,14 @@ void Arena::reset()
 
 MBuffer::~MBuffer()
 {
-    if (noCopyPtr && bo) {
+    if (noCopyPtr && bo && dev && dev->drm && dev->drm->simulated()) {
+        // the buffer is the client's memory itself: nothing to unmap or copy back
+        if (deallocator) {
+            callBlock(deallocator, noCopyPtr, (uintptr_t)length);
+            _Block_release(deallocator);
+        }
+        bo->map = nullptr;
+    } else if (noCopyPtr && bo) {
         // Give the client back ordinary memory with the final contents at its address.
         std::vector<uint8_t> tmp(bo->map, bo->map + length);
         void* p = mmap(noCopyPtr, (length + 16383) & ~16383ull, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -225,14 +245,27 @@ MDevice* defaultDevice()
     static MDevice* dev = [] {
         MDevice* d = make<MDevice>("MTLAsahiDevice");
         std::string err;
-        d->drm = DrmDevice::open(err);
+        const char* simGpu = getenv("METAL_ASAHI_SIM_GPU");
+        std::string chip = simGpu && *simGpu ? simGpu : "agx-g14c";
+        if (simulatedDeviceRequested()) {
+            d->drm = DrmDevice::openSimulated(chip, err);
+        } else {
+            d->drm = DrmDevice::open(err);
+            if (!d->drm && execMode() == ExecMode::Simulator) {
+                // sim mode needs no GPU: fall back to the simulated device
+                if (debugLevel() > 0) warn("%s; METAL_ASAHI_MODE=sim continues on the simulated device", err.c_str());
+                err.clear();
+                d->drm = DrmDevice::openSimulated(chip, err);
+            }
+        }
         if (!d->drm) {
             d->error = err;
-            if (execMode() != ExecMode::Simulator) {
-                warn("%s", err.c_str());
-                return (MDevice*)nullptr;
-            }
-            warn("%s (simulator-only mode continues without a GPU)", err.c_str());
+            warn("%s", err.c_str());
+            return (MDevice*)nullptr;
+        }
+        if (d->drm->simulated() && !simulatorAvailable()) {
+            warn("the simulated device needs the AGX Performance Simulator's agx_run (METAL_ASAHI_AGX_RUN=%s is not executable)",
+                 simulatorPath().c_str());
             return (MDevice*)nullptr;
         }
         const GpuInfo& gi = d->drm->info();
@@ -459,7 +492,12 @@ void registerDevice()
             if (ptr && len) memcpy(b->bo->map, ptr, len);
             // Alias the client's pages to the GPU buffer, so both see one memory. Metal requires a
             // page-aligned pointer and a whole number of pages; anything else is copied (not shared).
-            if (ptr && ((uintptr_t)ptr & 16383) == 0 && (len & 16383) == 0 && len) {
+            if (ptr && len && d->drm->simulated()) {
+                // simulated device: the buffer's memory is the client's (any alignment)
+                munmap(b->bo->map, b->bo->size);
+                b->bo->map = (uint8_t*)ptr;
+                b->noCopyPtr = ptr;
+            } else if (ptr && ((uintptr_t)ptr & 16383) == 0 && (len & 16383) == 0 && len) {
                 void* p = mmap(ptr, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm->fd(), (off_t)b->bo->mmapOffset);
                 if (p == ptr) b->noCopyPtr = ptr;
                 else warn("newBufferWithBytesNoCopy: cannot alias %p (%s); the buffer is a copy", ptr, strerror(errno));

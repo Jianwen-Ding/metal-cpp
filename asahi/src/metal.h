@@ -15,6 +15,7 @@ namespace masahi {
 
 enum class ExecMode { Hardware, Simulator, Preflight, Verify };
 ExecMode execMode();
+bool simulatedDeviceRequested();
 
 struct MDevice;
 
