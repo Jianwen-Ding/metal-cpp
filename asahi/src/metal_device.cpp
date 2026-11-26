@@ -1,15 +1,21 @@
 // libmetal_asahi: MTLDevice, MTLBuffer, MTLLibrary, MTLFunction,
 // MTLComputePipelineState, descriptors and events.
 #include "metal.h"
+
+#include <thread>
+
+#include <atomic>
 #include "sim.h"
 
 #include <dispatch/dispatch.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 
 namespace masahi {
@@ -269,19 +275,35 @@ static MLibrary* newLibraryFromBytes(MDevice* d, const uint8_t* data, size_t siz
         setError(error, "MTLLibraryErrorDomain", 1, "%s", err.c_str());
         return nullptr;
     }
+    // The modules of a .metallib (one per kernel) compile in parallel, each in its own LLVMContext.
+    std::vector<CompiledModule> compiled(mods.size());
+    {
+        unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        unsigned n = (unsigned)std::min<size_t>(mods.size(), std::min(8u, hw));
+        if (const char* j = getenv("METAL_ASAHI_COMPILE_THREADS")) n = (unsigned)std::max(1, atoi(j));
+        std::atomic<size_t> next{0};
+        auto work = [&] {
+            for (size_t i; (i = next++) < mods.size();) compiled[i] = compileAIRCached(mods[i], d->compileOpts);
+        };
+        std::vector<std::thread> ts;
+        for (unsigned t = 1; t < n; t++) ts.emplace_back(work);
+        work();
+        for (auto& t : ts) t.join();
+    }
     MLibrary* lib = make<MLibrary>("MTLAsahiLibrary");
     lib->dev = d;
-    for (auto& bc : mods) {
+    for (size_t ci = 0; ci < mods.size(); ci++) {
         auto m = std::make_unique<LibModule>();
-        m->bitcode = std::move(bc);
-        m->compiled = compileAIR(m->bitcode, d->compileOpts);
+        m->bitcode = std::move(mods[ci]);
+        m->compiled = std::move(compiled[ci]);
         if (!m->compiled.error.empty()) {
             setError(error, "MTLLibraryErrorDomain", 3, "%s", m->compiled.error.c_str());
             lib->destroy(lib);
             return nullptr;
         }
         if (debugLevel() > 0)
-            warn("compiled %zu kernel(s) in %.1f ms", m->compiled.kernels.size(), m->compiled.compileSeconds * 1e3);
+            warn("%s %zu kernel(s) in %.1f ms", m->compiled.fromCache ? "loaded (cache)" : "compiled", m->compiled.kernels.size(),
+                 m->compiled.compileSeconds * 1e3);
         auto& cm = m->compiled;
         if (!cm.globals.empty()) {
             m->globals = d->drm->alloc(cm.globals.size(), false);

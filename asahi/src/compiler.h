@@ -81,6 +81,11 @@ std::vector<std::vector<uint8_t>> splitAIRContainer(const uint8_t* data, size_t 
 // Compiles one AIR bitcode module for AGX.
 CompiledModule compileAIR(const std::vector<uint8_t>& bitcode, const CompileOptions& opts);
 
+// compileAIR through the on-disk cache: $METAL_ASAHI_CACHE_DIR, else $XDG_CACHE_HOME/metal-asahi or
+// ~/.cache/metal-asahi (METAL_ASAHI_CACHE=0: off). The key is the bitcode, the options, the extra LLVM
+// arguments and the identity of libLLVM and of this library; an entry holds the object and the AIR facts.
+CompiledModule compileAIRCached(const std::vector<uint8_t>& bitcode, const CompileOptions& opts);
+
 // Function names (kernels) of an AIR module, without compiling it.
 std::vector<std::string> kernelNames(const std::vector<uint8_t>& bitcode, std::string& error);
 

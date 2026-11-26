@@ -84,13 +84,13 @@ $(BENCH): bench/bench.cpp tests/harness.h $(LIB)
 
 # Benchmarks: `make bench` (GPU timings); the scaled-down run is checked on the simulator first.
 bench: $(BENCH) $(KERNELS)
-	KERNEL_DIR=$(abspath $(BUILD)/kernels) METAL_ASAHI_MODE=verify $(BENCH) --small
-	KERNEL_DIR=$(abspath $(BUILD)/kernels) METAL_ASAHI_MODE=hw $(BENCH)
+	KERNEL_DIR=$(abspath $(BUILD)/kernels) METAL_ASAHI_CACHE=0 METAL_ASAHI_MODE=verify $(BENCH) --small
+	KERNEL_DIR=$(abspath $(BUILD)/kernels) METAL_ASAHI_CACHE=0 METAL_ASAHI_MODE=hw $(BENCH)
 
 kernels: $(KERNELS)
 tests: $(TESTS) $(KERNELS) $(AIRC)
 
-RUN_TESTS = KERNEL_DIR=$(abspath $(BUILD)/kernels) python3 tools/run-tests.py $(TESTS)
+RUN_TESTS = KERNEL_DIR=$(abspath $(BUILD)/kernels) METAL_ASAHI_CACHE_DIR=$(abspath $(BUILD)/cache) python3 tools/run-tests.py $(TESTS)
 
 check: tests
 	METAL_ASAHI_MODE=$${METAL_ASAHI_MODE:-verify} $(RUN_TESTS)

@@ -28,7 +28,12 @@
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include <algorithm>
 #include <chrono>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -488,6 +493,233 @@ CompiledModule compileAIR(const std::vector<uint8_t>& bitcode, const CompileOpti
     }
     out.compileSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return out;
+}
+
+// ---------------------------------------------------------------- compile cache
+
+namespace {
+
+struct Hasher {
+    uint64_t a = 0xcbf29ce484222325ull, b = 0x9e3779b97f4a7c15ull;
+    void bytes(const void* p, size_t n)
+    {
+        const uint8_t* c = (const uint8_t*)p;
+        for (size_t i = 0; i < n; i++) {
+            a = (a ^ c[i]) * 0x100000001b3ull;
+            b = (b + c[i] + 1) * 0xff51afd7ed558ccdull;
+            b ^= b >> 29;
+        }
+    }
+    void str(const std::string& s)
+    {
+        uint64_t n = s.size();
+        bytes(&n, 8);
+        bytes(s.data(), s.size());
+    }
+};
+
+// The files whose code decides the compile's output: libLLVM and this library (path, size, mtime).
+std::string toolchainIdentity()
+{
+    static std::string id = [] {
+        std::string r;
+        for (void* sym : {(void*)&LLVMInitializeAGXTarget, (void*)&toolchainIdentity}) {
+            Dl_info info;
+            struct stat st;
+            if (dladdr(sym, &info) && info.dli_fname && stat(info.dli_fname, &st) == 0)
+                r += std::string(info.dli_fname) + ":" + std::to_string(st.st_size) + ":" + std::to_string(st.st_mtim.tv_sec) + "." +
+                     std::to_string(st.st_mtim.tv_nsec) + ";";
+        }
+        return r;
+    }();
+    return id;
+}
+
+std::string cacheDir()
+{
+    static std::string dir = [] {
+        const char* off = getenv("METAL_ASAHI_CACHE");
+        if (off && !strcmp(off, "0")) return std::string();
+        std::string d;
+        if (const char* c = getenv("METAL_ASAHI_CACHE_DIR"); c && *c) d = c;
+        else if (const char* x = getenv("XDG_CACHE_HOME"); x && *x) d = std::string(x) + "/metal-asahi";
+        else if (const char* h = getenv("HOME"); h && *h) d = std::string(h) + "/.cache/metal-asahi";
+        else return std::string();
+        // mkdir -p
+        for (size_t i = 1; i <= d.size(); i++)
+            if (i == d.size() || d[i] == '/') mkdir(d.substr(0, i).c_str(), 0700);
+        return access(d.c_str(), W_OK) == 0 ? d : std::string();
+    }();
+    return dir;
+}
+
+constexpr uint32_t kCacheMagic = 0x4353414d; // "MASC"
+constexpr uint32_t kCacheVersion = 2; // magic, version, 128-bit hash of the payload, payload
+
+uint64_t payloadHash(const uint8_t* p, size_t n, uint64_t* b)
+{
+    Hasher h;
+    h.bytes(p, n);
+    *b = h.b;
+    return h.a;
+}
+
+struct Writer {
+    std::vector<uint8_t> b;
+    void u32(uint32_t v) { b.insert(b.end(), (uint8_t*)&v, (uint8_t*)&v + 4); }
+    void u64(uint64_t v) { b.insert(b.end(), (uint8_t*)&v, (uint8_t*)&v + 8); }
+    void blob(const void* p, size_t n)
+    {
+        u64(n);
+        b.insert(b.end(), (const uint8_t*)p, (const uint8_t*)p + n);
+    }
+};
+
+struct Reader {
+    const std::vector<uint8_t>& b;
+    size_t i = 0;
+    bool ok = true;
+    bool take(void* p, size_t n)
+    {
+        if (!ok || n > b.size() - i) return ok = false;
+        memcpy(p, b.data() + i, n);
+        i += n;
+        return true;
+    }
+    uint32_t u32()
+    {
+        uint32_t v = 0;
+        take(&v, 4);
+        return v;
+    }
+    uint64_t u64()
+    {
+        uint64_t v = 0;
+        take(&v, 8);
+        return v;
+    }
+    bool blob(std::vector<uint8_t>& out)
+    {
+        uint64_t n = u64();
+        if (!ok || n > b.size() - i) return ok = false;
+        out.assign(b.begin() + i, b.begin() + i + n);
+        i += n;
+        return true;
+    }
+};
+
+bool loadCached(const std::string& path, CompiledModule& out)
+{
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    std::vector<uint8_t> b;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+        b.resize((size_t)st.st_size);
+        if (pread(fd, b.data(), b.size(), 0) != (ssize_t)b.size()) b.clear();
+    }
+    close(fd);
+    Reader r{b};
+    if (r.u32() != kCacheMagic || r.u32() != kCacheVersion) return false;
+    uint64_t ha = r.u64(), hb = r.u64(), cb = 0;
+    if (!r.ok || payloadHash(b.data() + r.i, b.size() - r.i, &cb) != ha || cb != hb) return false;
+    std::vector<uint8_t> obj;
+    if (!r.blob(obj)) return false;
+    uint32_t n = r.u32();
+    std::vector<std::pair<std::string, CompiledKernel>> facts;
+    for (uint32_t k = 0; k < n && r.ok; k++) {
+        std::vector<uint8_t> name;
+        r.blob(name);
+        CompiledKernel ck;
+        ck.name.assign(name.begin(), name.end());
+        ck.threadgroupBufferLocation = (int32_t)r.u32();
+        uint32_t na = r.u32();
+        for (uint32_t a = 0; a < na && r.ok && na < 4096; a++) {
+            KernelArg arg;
+            arg.location = r.u32();
+            arg.airAddrSpace = r.u32();
+            arg.byref = r.u32() != 0;
+            ck.args.push_back(arg);
+        }
+        facts.push_back({ck.name, std::move(ck)});
+    }
+    if (!r.ok || r.i != b.size()) return false;
+    CompiledModule m;
+    m.object = std::move(obj);
+    if (!readObject(m.object, m)) return false;
+    for (auto& k : m.kernels) {
+        auto it = std::find_if(facts.begin(), facts.end(), [&](auto& f) { return f.first == k.name; });
+        if (it == facts.end() || it->second.args.size() != k.args.size()) return false;
+        k.threadgroupBufferLocation = it->second.threadgroupBufferLocation;
+        for (size_t a = 0; a < k.args.size(); a++) {
+            k.args[a].location = it->second.args[a].location;
+            k.args[a].airAddrSpace = it->second.args[a].airAddrSpace;
+            k.args[a].byref = it->second.args[a].byref;
+        }
+    }
+    m.fromCache = true;
+    out = std::move(m);
+    return true;
+}
+
+void storeCached(const std::string& path, const CompiledModule& m)
+{
+    Writer w;
+    w.blob(m.object.data(), m.object.size());
+    w.u32((uint32_t)m.kernels.size());
+    for (auto& k : m.kernels) {
+        w.blob(k.name.data(), k.name.size());
+        w.u32((uint32_t)k.threadgroupBufferLocation);
+        w.u32((uint32_t)k.args.size());
+        for (auto& a : k.args) {
+            w.u32(a.location);
+            w.u32(a.airAddrSpace);
+            w.u32(a.byref ? 1 : 0);
+        }
+    }
+    Writer head;
+    head.u32(kCacheMagic);
+    head.u32(kCacheVersion);
+    uint64_t hb = 0, ha = payloadHash(w.b.data(), w.b.size(), &hb);
+    head.u64(ha);
+    head.u64(hb);
+    w.b.insert(w.b.begin(), head.b.begin(), head.b.end());
+    // written whole, then renamed into place: readers never see a partial entry
+    std::string tmp = path + ".tmp." + std::to_string(getpid()) + "." + std::to_string((uintptr_t)&m);
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    bool ok = write(fd, w.b.data(), w.b.size()) == (ssize_t)w.b.size();
+    ok = close(fd) == 0 && ok;
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) unlink(tmp.c_str());
+}
+
+} // namespace
+
+CompiledModule compileAIRCached(const std::vector<uint8_t>& bitcode, const CompileOptions& opts)
+{
+    std::string dir = cacheDir();
+    if (dir.empty()) return compileAIR(bitcode, opts);
+    auto t0 = std::chrono::steady_clock::now();
+    Hasher h;
+    h.str(toolchainIdentity());
+    h.str(opts.cpu);
+    h.str(opts.features);
+    h.str(opts.irPipeline);
+    h.bytes(&opts.optLevel, sizeof opts.optLevel);
+    h.bytes(&opts.fastMath, sizeof opts.fastMath);
+    for (const char* a : llvmArgs()) h.str(a);
+    h.bytes(bitcode.data(), bitcode.size());
+    char name[64];
+    snprintf(name, sizeof name, "/%016llx%016llx.agx", (unsigned long long)h.a, (unsigned long long)h.b);
+    std::string path = dir + name;
+    CompiledModule m;
+    if (loadCached(path, m)) {
+        m.compileSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return m;
+    }
+    m = compileAIR(bitcode, opts);
+    if (m.error.empty()) storeCached(path, m);
+    return m;
 }
 
 } // namespace masahi

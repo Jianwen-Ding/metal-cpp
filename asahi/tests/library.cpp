@@ -3,6 +3,7 @@
 
 #include <fstream>
 #include <iterator>
+#include <dirent.h>
 #include <sys/mman.h>
 
 TEST(function_names)
@@ -206,6 +207,56 @@ TEST(big_buffer)
     ((uint8_t*)b->contents())[len - 1] = 9;
     CHECK(((uint8_t*)b->contents())[len - 1] == 9);
     b->release();
+}
+
+// The compile cache (make check points METAL_ASAHI_CACHE_DIR at build/cache): a library loads from
+// it, and entries that are corrupt or truncated are compiled again, with the same results.
+TEST(compile_cache_bad_entries)
+{
+    const char* dir = getenv("METAL_ASAHI_CACHE_DIR");
+    if (!dir) return; // not hermetic: leave the user's cache alone
+    auto load = [] {
+        NS::Error* err = nullptr;
+        MTL::Library* lib = t::device()->newLibrary(NS::URL::fileURLWithPath(NS::String::string(t::kernelPath("basic.air").c_str(),
+                                                                                                  NS::UTF8StringEncoding)),
+                                                    &err);
+        return lib;
+    };
+    auto run = [](MTL::Library* lib) {
+        MTL::Function* f = lib->newFunction(MTLSTR("fill_index"));
+        NS::Error* err = nullptr;
+        MTL::ComputePipelineState* p = t::device()->newComputePipelineState(f, &err);
+        f->release();
+        MTL::Buffer* b = t::zeros(4096 * 4);
+        bool ok = t::dispatch(p, {b}, MTL::Size(4096, 1, 1), MTL::Size(64, 1, 1));
+        for (uint32_t i = 0; ok && i < 4096; i++) ok = t::data<uint32_t>(b)[i] == i;
+        b->release();
+        p->release();
+        return ok;
+    };
+    MTL::Library* lib = load(); // writes (or reads) the entry
+    CHECK(lib && run(lib));
+    lib->release();
+    std::vector<std::string> entries;
+    if (DIR* d = opendir(dir)) {
+        while (dirent* e = readdir(d))
+            if (strstr(e->d_name, ".agx")) entries.push_back(std::string(dir) + "/" + e->d_name);
+        closedir(d);
+    }
+    CHECK(!entries.empty());
+    for (int variant = 0; variant < 3; variant++) {
+        for (size_t i = 0; i < entries.size(); i++) {
+            std::ifstream in(entries[i], std::ios::binary);
+            std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            if (variant == 0) bytes.resize(bytes.size() / 2);          // truncated
+            else if (variant == 1) for (size_t k = 8; k < bytes.size(); k += 7) bytes[k] ^= 0x5a; // corrupted after the header
+            else bytes[bytes.size() / 2] ^= 0x01;                       // one bit (in the code): caught by the payload hash
+            std::ofstream(entries[i], std::ios::binary | std::ios::trunc).write(bytes.data(), (std::streamsize)bytes.size());
+        }
+        lib = load();
+        CHECK_MSG(lib && run(lib), "variant %d", variant);
+        lib->release();
+    }
 }
 
 TEST(device_properties)

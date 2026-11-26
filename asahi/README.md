@@ -71,7 +71,13 @@ default from the GPU: `agx-g14c` on M2 Max), `METAL_ASAHI_IR_PIPELINE` (default 
 `METAL_ASAHI_DISPATCHES_PER_COMMAND` (default 64), `METAL_ASAHI_MAX_IN_FLIGHT` (command buffers a queue keeps on
 the GPU at once, default 8), `METAL_ASAHI_LLVM_ARGS` (extra LLVM options for the kernel compiler, e.g.
 `-agx-tile-full-unroll-threshold=0`), `METAL_ASAHI_DUMP_IR` (file to write each module's IR to after the IR
-pipeline), `METAL_ASAHI_DRM_NODE`.
+pipeline), `METAL_ASAHI_CACHE_DIR` / `METAL_ASAHI_CACHE=0` (compiled-kernel cache, default
+`$XDG_CACHE_HOME/metal-asahi` or `~/.cache/metal-asahi`), `METAL_ASAHI_COMPILE_THREADS` (threads compiling a
+`.metallib`'s modules, default up to 8), `METAL_ASAHI_DRM_NODE`.
+
+Compiled kernels are cached on disk, keyed by the AIR bitcode, the compile options, `METAL_ASAHI_LLVM_ARGS` and
+the identity (path, size, mtime) of `libLLVM` and `libmetal_asahi`. An entry carries a 128-bit hash of its contents;
+a damaged one is compiled again. A `.metallib`'s modules compile in parallel.
 
 Command buffers are pipelined: the last GPU submission of a command buffer stays in flight while the queue
 prepares and submits the next ones, and a completion thread retires them in commit order (status, GPU times,
@@ -105,7 +111,8 @@ the M2 Max (38 cores, 1398 MHz, AC power), 2026-11-26:
 
 | Benchmark | Result |
 | --- | --- |
-| compile `workloads.air` (14 kernels) | 25 ms, 57 MB max RSS for the whole run |
+| compile `workloads.air` (14 kernels) | 25 ms (0.2 ms from the cache), 57 MB max RSS for the whole run (25 cached) |
+| compile `workloads.metallib` (14 modules) | 44 ms on 1 thread, 14 ms on 8 |
 | 1 dispatch, commit + wait | ~120 µs median |
 | command buffers in flight, 1 dispatch each | 45 µs per command buffer (188 µs before pipelining) |
 | dispatches in one command buffer | 3.5-4 µs GPU, 5.5-6 µs wall each |
