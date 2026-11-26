@@ -304,31 +304,47 @@ static void failBuffer(MCommandBuffer* cb, intptr_t code, const std::string& msg
     warn("command buffer failed: %s", msg.c_str());
 }
 
-static void runBatch(MQueue* q, MCommandBuffer* cb, std::vector<ComputeCommand>& cmds, double& firstStart, double& lastEnd)
+static constexpr uint32_t kFrameTimestamps = 64;
+
+static void addTimes(Frame* f, DrmDevice* drm, size_t n)
 {
-    if (cmds.empty()) return;
-    DrmDevice* drm = q->dev->drm;
-    std::vector<std::pair<uint64_t, uint64_t>> ts;
-    std::string err;
-    double hostBefore = hostNow();
-    uint64_t gpuBefore = drm->gpuTimeNs();
-    drm->resetSyncobj(q->syncobj);
-    gStats[4]++;
-    if (!drm->submit(q->drmQueue, cmds, 0, q->syncobj, &ts, err)) {
-        failBuffer(cb, err.find("timeout") != std::string::npos ? 2 : 1, err);
-        cmds.clear();
-        return;
-    }
     double hz = (double)drm->info().timestampHz;
     // Firmware timestamps are GPU timer ticks; place them on the host clock through one GET_TIME sample.
-    double offset = hostBefore - (double)gpuBefore * 1e-9;
-    for (auto& t : ts) {
+    double offset = f->hostBefore - (double)f->gpuBefore * 1e-9;
+    for (size_t k = 0; k < n && f->tsBase; k++) {
+        auto t = drm->timestamp(f->tsBase + (uint32_t)k);
         if (!t.first || !t.second) continue;
         double s = (double)t.first / hz + offset, e = (double)t.second / hz + offset;
-        if (firstStart == 0 || s < firstStart) firstStart = s;
-        if (e > lastEnd) lastEnd = e;
+        if (f->firstStart == 0 || s < f->firstStart) f->firstStart = s;
+        if (e > f->lastEnd) f->lastEnd = e;
+    }
+}
+
+// Submits cmds on the frame's syncobj. Waits for them unless async (the last
+// submission of a command buffer, which the completer thread retires).
+static bool runBatch(MQueue* q, MCommandBuffer* cb, std::vector<ComputeCommand>& cmds, bool async = false)
+{
+    if (cmds.empty()) return false;
+    Frame* f = q->cur;
+    DrmDevice* drm = q->dev->drm;
+    std::string err;
+    f->hostBefore = hostNow();
+    f->gpuBefore = drm->gpuTimeNs();
+    drm->resetSyncobj(f->syncobj);
+    gStats[4]++;
+    size_t n = cmds.size();
+    if (!drm->submit(q->drmQueue, cmds, 0, f->syncobj, f->tsBase, !async, err)) {
+        failBuffer(cb, err.find("timeout") != std::string::npos ? 2 : 1, err);
+        cmds.clear();
+        return false;
     }
     cmds.clear();
+    if (async) {
+        f->tsUsed = n;
+        return true;
+    }
+    addTimes(f, drm, n);
+    return false;
 }
 
 // Puts dispatches into compute commands: several launches per CDM stream, each
@@ -340,8 +356,6 @@ static void runBatch(MQueue* q, MCommandBuffer* cb, std::vector<ComputeCommand>&
 struct Batcher {
     MQueue* q;
     MCommandBuffer* cb;
-    double& firstStart;
-    double& lastEnd;
     size_t maxCmds = 64, perCmd = 64;
     std::vector<ComputeCommand> cmds;
     std::vector<uint8_t> stream;
@@ -379,12 +393,18 @@ struct Batcher {
         }
         stream.clear();
         inStream = 0;
-        if (cmds.size() >= maxCmds) runBatch(q, cb, cmds, firstStart, lastEnd);
+        if (cmds.size() >= maxCmds) runBatch(q, cb, cmds);
     }
     void flush()
     {
         close();
-        runBatch(q, cb, cmds, firstStart, lastEnd);
+        runBatch(q, cb, cmds);
+    }
+    // The command buffer's last submission, left in flight: true if there was one.
+    bool flushAsync()
+    {
+        close();
+        return runBatch(q, cb, cmds, true);
     }
 };
 
@@ -410,11 +430,12 @@ static bool compareVerify(DispatchCmd& dc, SimState& s)
     return ok;
 }
 
-static void execute(MQueue* q, MCommandBuffer* cb)
+// Runs a command buffer's commands. Returns true when its last GPU submission
+// is still in flight (the completer finishes it), false when it is done.
+static bool execute(MQueue* q, MCommandBuffer* cb)
 {
     ExecMode mode = execMode();
-    double firstStart = 0, lastEnd = 0;
-    Batcher batch{q, cb, firstStart, lastEnd};
+    Batcher batch{q, cb};
     batch.maxCmds = q->dev->drm ? std::min<size_t>(q->dev->drm->info().maxCommandsPerSubmission, 64) : 1;
     if (const char* mb = getenv("METAL_ASAHI_MAX_BATCH")) batch.maxCmds = std::max<size_t>(1, std::min<size_t>(batch.maxCmds, atoi(mb)));
     if (const char* pc = getenv("METAL_ASAHI_DISPATCHES_PER_COMMAND")) batch.perCmd = std::max(1, atoi(pc));
@@ -449,6 +470,7 @@ static void execute(MQueue* q, MCommandBuffer* cb)
             }
             // Simulated dispatches run alone, so the simulator sees the memory the GPU would.
             batch.flush();
+            q->drain();
             if (cb->error) break;
             SimState s;
             buildSim(dc, p, s);
@@ -478,6 +500,7 @@ static void execute(MQueue* q, MCommandBuffer* cb)
         }
         case Command::Blit: {
             batch.flush();
+            q->drain();
             BlitCmd& b = *c.blit;
             auto* dst = static_cast<MBuffer*>(b.dst.get());
             if (b.kind == BlitCmd::Copy) {
@@ -499,6 +522,7 @@ static void execute(MQueue* q, MCommandBuffer* cb)
         }
         case Command::Event: {
             batch.flush();
+            q->drain();
             auto* e = static_cast<MEvent*>(c.event->event.get());
             if (c.event->wait) {
                 std::unique_lock<std::mutex> l(e->m);
@@ -515,14 +539,34 @@ static void execute(MQueue* q, MCommandBuffer* cb)
         }
         }
     }
-    if (!cb->error) batch.flush();
+    q->cur->kernelStart = kStart;
+    return !cb->error && batch.flushAsync();
+}
+
+// The command buffer's times and status, its completed handlers; frees its frame.
+static void finish(MQueue* q, MCommandBuffer* cb, Frame* f)
+{
     double kEnd = hostNow();
-    cb->kernelStart = kStart;
+    cb->kernelStart = f->kernelStart;
     cb->kernelEnd = kEnd;
-    cb->gpuStart = firstStart ? firstStart : kStart;
-    cb->gpuEnd = lastEnd ? lastEnd : kEnd;
-    q->data->reset();
-    q->usc->reset();
+    cb->gpuStart = f->firstStart ? f->firstStart : f->kernelStart;
+    cb->gpuEnd = f->lastEnd ? f->lastEnd : kEnd;
+    f->data->reset();
+    f->usc->reset();
+    f->firstStart = f->lastEnd = 0;
+    f->cb = nullptr;
+    {
+        std::lock_guard<std::mutex> l(cb->m);
+        cb->status = cb->error ? StatusError : Completed;
+    }
+    for (void* h : cb->completedHandlers) callBlock(h, (Object*)cb);
+    cb->cv.notify_all();
+    {
+        std::lock_guard<std::mutex> l(q->fm);
+        q->freeFrames.push_back(f);
+    }
+    q->fcv.notify_all();
+    release(cb);
 }
 
 void MQueue::run()
@@ -534,27 +578,71 @@ void MQueue::run()
             cv.wait(l, [&] { return stop || !pending.empty(); });
             if (pending.empty()) return;
             cb = pending.front();
+            pending.pop_front();
         }
+        Frame* f;
+        {
+            std::unique_lock<std::mutex> l(fm);
+            fcv.wait(l, [&] { return !freeFrames.empty(); });
+            f = freeFrames.front();
+            freeFrames.pop_front();
+        }
+        cur = f;
+        data = f->data.get();
+        usc = f->usc.get();
         {
             std::lock_guard<std::mutex> l(cb->m);
             cb->status = Scheduled;
         }
         cb->cv.notify_all();
         for (void* h : cb->scheduledHandlers) callBlock(h, (Object*)cb);
-        execute(this, cb);
-        {
-            std::lock_guard<std::mutex> l(cb->m);
-            cb->status = cb->error ? StatusError : Completed;
+        f->firstStart = f->lastEnd = 0;
+        if (execute(this, cb)) {
+            f->cb = cb;
+            {
+                std::lock_guard<std::mutex> l(fm);
+                inFlight.push_back(f);
+            }
+            fcv.notify_all();
+        } else {
+            drain(); // command buffers complete in order
+            finish(this, cb, f);
         }
-        for (void* h : cb->completedHandlers) callBlock(h, (Object*)cb);
-        cb->cv.notify_all();
-        {
-            std::lock_guard<std::mutex> l(m);
-            pending.pop_front();
-        }
-        cv.notify_all();
-        release(cb);
+        cur = nullptr;
     }
+}
+
+// The completer: retires in-flight frames in submission order.
+void MQueue::complete()
+{
+    for (;;) {
+        Frame* f;
+        {
+            std::unique_lock<std::mutex> l(fm);
+            fcv.wait(l, [&] { return completerStop || !inFlight.empty(); });
+            if (inFlight.empty()) return;
+            f = inFlight.front();
+        }
+        DrmDevice* drm = dev->drm;
+        MCommandBuffer* cb = f->cb;
+        int r = drm->waitSyncobj(f->syncobj, 10ull * 1000000000ull);
+        if (r != 0)
+            failBuffer(cb, r == ETIME ? 2 : 1,
+                       r == ETIME ? "GPU timeout (10 s): the command did not finish" : "syncobj wait failed: " + std::string(strerror(r)));
+        else
+            addTimes(f, drm, f->tsUsed);
+        {
+            std::lock_guard<std::mutex> l(fm);
+            inFlight.pop_front();
+        }
+        finish(this, cb, f);
+    }
+}
+
+void MQueue::drain()
+{
+    std::unique_lock<std::mutex> l(fm);
+    fcv.wait(l, [&] { return inFlight.empty(); });
 }
 
 MQueue::~MQueue()
@@ -565,12 +653,21 @@ MQueue::~MQueue()
     }
     cv.notify_all();
     if (worker.joinable()) worker.join();
-    data.reset();
-    usc.reset();
-    if (dev && dev->drm) {
-        if (drmQueue != ~0u) dev->drm->destroyQueue(drmQueue);
-        if (syncobj) dev->drm->destroySyncobj(syncobj);
+    {
+        std::lock_guard<std::mutex> l(fm);
+        completerStop = true;
     }
+    fcv.notify_all();
+    if (completer.joinable()) completer.join();
+    for (auto& f : frames) {
+        f->data.reset();
+        f->usc.reset();
+        if (dev && dev->drm) {
+            if (f->syncobj) dev->drm->destroySyncobj(f->syncobj);
+            dev->drm->freeTimestamps(f->tsBase, kFrameTimestamps);
+        }
+    }
+    if (dev && dev->drm && drmQueue != ~0u) dev->drm->destroyQueue(drmQueue);
 }
 
 MCommandBuffer::~MCommandBuffer()
@@ -584,18 +681,35 @@ Object* newQueue(MDevice* d, uintptr_t)
     MQueue* q = make<MQueue>("MTLAsahiCommandQueue");
     q->dev = d;
     q->devRef = Ref<Object>(d);
+    // METAL_ASAHI_MAX_IN_FLIGHT: command buffers the GPU may have at once (1: each waits for the one before).
+    int depth = 8;
+    if (const char* e = getenv("METAL_ASAHI_MAX_IN_FLIGHT")) depth = std::max(1, std::min(32, atoi(e)));
     if (d->drm) {
         q->drmQueue = d->drm->createQueue(1 /* medium */);
-        q->syncobj = d->drm->createSyncobj();
-        if (q->drmQueue == ~0u || !q->syncobj) {
+        if (q->drmQueue == ~0u) {
             warn("cannot create a GPU queue: %s", strerror(errno));
             q->destroy(q);
             return nullptr;
         }
     }
-    q->data = std::make_unique<Arena>(d, false);
-    q->usc = std::make_unique<Arena>(d, true);
+    for (int i = 0; i < depth; i++) {
+        auto f = std::make_unique<Frame>();
+        f->data = std::make_unique<Arena>(d, false);
+        f->usc = std::make_unique<Arena>(d, true);
+        if (d->drm) {
+            f->syncobj = d->drm->createSyncobj();
+            f->tsBase = d->drm->allocTimestamps(kFrameTimestamps);
+            if (!f->syncobj) {
+                warn("cannot create a syncobj: %s", strerror(errno));
+                q->destroy(q);
+                return nullptr;
+            }
+        }
+        q->freeFrames.push_back(f.get());
+        q->frames.push_back(std::move(f));
+    }
     q->worker = std::thread([q] { q->run(); });
+    q->completer = std::thread([q] { q->complete(); });
     return q;
 }
 

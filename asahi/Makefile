@@ -77,6 +77,16 @@ $(AIRC): tools/airc.cpp src/compiler.cpp src/compiler.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(OPT) -std=c++20 -fno-rtti $(LLVM_CXXFLAGS) tools/airc.cpp src/compiler.cpp -o $@ $(LLVM_LIBS)
 
+BENCH := $(BUILD)/bench/bench
+$(BENCH): bench/bench.cpp tests/harness.h $(LIB)
+	@mkdir -p $(dir $@)
+	$(CLANGXX) $(APP_CXXFLAGS) $< -o $@ $(APP_LIBS)
+
+# Benchmarks: `make bench` (GPU timings); the scaled-down run is checked on the simulator first.
+bench: $(BENCH) $(KERNELS)
+	KERNEL_DIR=$(abspath $(BUILD)/kernels) METAL_ASAHI_MODE=verify $(BENCH) --small
+	KERNEL_DIR=$(abspath $(BUILD)/kernels) METAL_ASAHI_MODE=hw $(BENCH)
+
 kernels: $(KERNELS)
 tests: $(TESTS) $(KERNELS) $(AIRC)
 
@@ -94,5 +104,5 @@ check-hw: tests
 clean:
 	rm -f $(BUILD)/obj/*.o $(LIB) $(TESTS) $(KERNELS)
 
-.PHONY: all kernels tests check check-sim check-hw clean
+.PHONY: all bench kernels tests check check-sim check-hw clean
 .SECONDARY:

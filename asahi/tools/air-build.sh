@@ -15,7 +15,7 @@ trap cleanup EXIT
 case "$src" in
 *.cl)
   # kernels/air_kernel.h stands in for OpenCL's library header.
-  "$B/clang" -x cl -cl-std=CL2.0 -target spir64 -O2 -emit-llvm -S -cl-fast-relaxed-math \
+  "$B/clang" -x cl -cl-std=CL2.0 -target spir64 -O2 -emit-llvm -S -cl-fast-relaxed-math -fno-slp-vectorize -fno-vectorize \
       -I"$(dirname "$0")/../kernels" -include air_kernel.h "$@" "$src" -o "$tmp/k.ll"
   # AIR's address spaces are SPIR's (1 device, 2 constant, 3 threadgroup);
   # drop SPIR's layout, and keep only the kernels as entry points.

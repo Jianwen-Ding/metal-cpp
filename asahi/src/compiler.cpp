@@ -17,6 +17,9 @@
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Object/ELFObjectFile.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/LibraryOptionsContext.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
@@ -26,6 +29,10 @@
 #include "llvm/TargetParser/Triple.h"
 
 #include <chrono>
+#include <cstdlib>
+#include <sstream>
+#include <string>
+#include <vector>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -43,6 +50,23 @@ static void initLLVM()
         LLVMInitializeAGXTargetMC();
         LLVMInitializeAGXAsmPrinter();
     });
+}
+
+// METAL_ASAHI_LLVM_ARGS: extra LLVM options (e.g. "-unroll-threshold=600 -agx-device-unroll=8"), for
+// tuning. Options of per-context libraries (the pass pipelines) live in each LLVMContext.
+static const std::vector<const char*>& llvmArgs()
+{
+    static std::vector<std::string> words;
+    static std::vector<const char*> argv = [] {
+        std::vector<const char*> v{"metal_asahi"};
+        if (const char* a = getenv("METAL_ASAHI_LLVM_ARGS")) {
+            std::istringstream in(a);
+            for (std::string w; in >> w;) words.push_back(w);
+        }
+        for (auto& w : words) v.push_back(w.c_str());
+        return v;
+    }();
+    return argv;
 }
 
 static uint32_t rd32(const uint8_t* p)
@@ -337,6 +361,10 @@ CompiledModule compileAIR(const std::vector<uint8_t>& bitcode, const CompileOpti
     LLVMContext ctx;
     std::string diag;
     ctx.setDiagnosticHandler(std::make_unique<DiagCollector>(&diag));
+    if (llvmArgs().size() > 1 && !cl::parseCommandLineOptions(ctx.getLibraryOptions(), llvmArgs(), "", &errs())) {
+        out.error = "bad METAL_ASAHI_LLVM_ARGS";
+        return out;
+    }
     auto buf = MemoryBuffer::getMemBuffer(StringRef((const char*)bitcode.data(), bitcode.size()), "air", false);
     // Keep AIR's data layout while reading: agx-lower-air switches it to AGX's.
     auto mOr = parseBitcodeFile(buf->getMemBufferRef(), ctx, ParserCallbacks([](StringRef, StringRef) -> std::optional<std::string> {
@@ -404,6 +432,12 @@ CompiledModule compileAIR(const std::vector<uint8_t>& bitcode, const CompileOpti
             return out;
         }
         mpm.run(*M, mam);
+        // METAL_ASAHI_DUMP_IR=file: the module after the IR pipeline (for tuning the backend).
+        if (const char* dump = getenv("METAL_ASAHI_DUMP_IR")) {
+            std::error_code ec;
+            raw_fd_ostream os(dump, ec);
+            if (!ec) M->print(os, nullptr);
+        }
         if (!diag.empty()) {
             out.error = "AIR lowering failed:\n" + diag;
             return out;

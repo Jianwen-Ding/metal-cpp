@@ -157,20 +157,43 @@ struct MEvent : Object {
     bool shared = false;
 };
 
+// What one command buffer's GPU work needs until it completes: its upload
+// memory, a syncobj and timestamp slots. A queue has a few, so the GPU runs a
+// command buffer while the next ones are prepared and submitted.
+struct Frame {
+    std::unique_ptr<Arena> data, usc;
+    uint32_t syncobj = 0;
+    uint32_t tsBase = 0;           // kFrameTimestamps slots, 0: none
+    MCommandBuffer* cb = nullptr;  // in flight: completes when syncobj signals
+    size_t tsUsed = 0;             // commands of the in-flight submission
+    double hostBefore = 0;         // clock sample for its timestamps
+    uint64_t gpuBefore = 0;
+    double firstStart = 0, lastEnd = 0, kernelStart = 0;
+};
+
 struct MQueue : Object {
     MDevice* dev = nullptr;
     Ref<Object> devRef;
     uint32_t drmQueue = ~0u;
-    uint32_t syncobj = 0;
     std::string label;
     std::mutex m;
     std::condition_variable cv;
     std::deque<MCommandBuffer*> pending; // retained
-    std::thread worker;
+    std::thread worker, completer;
     bool stop = false;
-    std::unique_ptr<Arena> data, usc;
+    // frames: free ones, and in flight (oldest first) for the completer
+    std::vector<std::unique_ptr<Frame>> frames;
+    std::mutex fm;
+    std::condition_variable fcv;
+    std::deque<Frame*> freeFrames, inFlight;
+    bool completerStop = false;
+    Frame* cur = nullptr;          // the frame of the command buffer being executed
+    Arena* data = nullptr;         // cur's arenas
+    Arena* usc = nullptr;
     ~MQueue();
     void run();
+    void complete();
+    void drain();                  // waits until no frame is in flight
 };
 
 struct MDevice : Object {

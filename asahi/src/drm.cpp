@@ -19,6 +19,7 @@
 namespace masahi {
 
 static const uint64_t kPage = 16384;
+static const uint64_t kTsBytes = 16 * kPage; // 16384 timestamp slots of 16 bytes
 
 void VaHeap::init(uint64_t base, uint64_t size)
 {
@@ -154,7 +155,7 @@ bool DrmDevice::init(int fd, std::string& error)
     uscHeap_.init(shaderBase + kPage, 0x100000000ull - kPage);
     dataHeap_.init(dataBase + kPage, vc.kernel_start - dataBase - kPage);
 
-    tsBo_ = alloc(kPage, false);
+    tsBo_ = alloc(kTsBytes, false);
     if (!tsBo_) {
         error = "cannot allocate the timestamp buffer";
         return false;
@@ -163,12 +164,13 @@ bool DrmDevice::init(int fd, std::string& error)
     bo.op = DRM_ASAHI_BIND_OBJECT_OP_BIND;
     bo.flags = DRM_ASAHI_BIND_OBJECT_USAGE_TIMESTAMPS;
     bo.handle = tsBo_->handle;
-    bo.range = kPage;
+    bo.range = kTsBytes;
     if (xioctl(fd_, DRM_IOCTL_ASAHI_GEM_BIND_OBJECT, &bo) != 0) {
         error = "binding the timestamp buffer failed: " + std::string(strerror(errno));
         return false;
     }
     tsObject_ = bo.object_handle;
+    tsFree_.push_back({1, (uint32_t)(kTsBytes / 16) - 1}); // slot 0 unused
     return true;
 }
 
@@ -330,20 +332,47 @@ uint64_t DrmDevice::gpuTimeNs()
     return t.gpu_timestamp;
 }
 
+uint32_t DrmDevice::allocTimestamps(uint32_t n)
+{
+    std::lock_guard<std::mutex> l(tsMutex_);
+    for (auto& r : tsFree_) {
+        if (r.second < n) continue;
+        uint32_t base = r.first;
+        r.first += n;
+        r.second -= n;
+        return base;
+    }
+    return 0;
+}
+
+void DrmDevice::freeTimestamps(uint32_t base, uint32_t n)
+{
+    if (!base) return;
+    std::lock_guard<std::mutex> l(tsMutex_);
+    tsFree_.push_back({base, n});
+}
+
+std::pair<uint64_t, uint64_t> DrmDevice::timestamp(uint32_t slot) const
+{
+    std::pair<uint64_t, uint64_t> t{0, 0};
+    if (slot) memcpy(&t, tsBo_->map + 16ull * slot, 16);
+    return t;
+}
+
 bool DrmDevice::submit(uint32_t queue, const std::vector<ComputeCommand>& cmds, uint32_t inSync, uint32_t outSync,
-                       std::vector<std::pair<uint64_t, uint64_t>>* tsOut, std::string& error)
+                       uint32_t tsBase, bool wait, std::string& error)
 {
     struct Cmd {
         drm_asahi_cmd_header h;
         drm_asahi_cmd_compute c;
     };
-    if (cmds.empty() || cmds.size() > info_.maxCommandsPerSubmission || cmds.size() > kPage / 16) {
+    static constexpr size_t kMaxCmds = 64;
+    if (cmds.empty() || cmds.size() > info_.maxCommandsPerSubmission || cmds.size() > kMaxCmds) {
         error = "bad command count";
         return false;
     }
-    std::vector<Cmd> buf(cmds.size());
-    std::lock_guard<std::mutex> l(tsMutex_); // one submission at a time owns the timestamp slots
-    memset(tsBo_->map, 0, 16 * cmds.size());
+    Cmd buf[kMaxCmds];
+    if (tsBase) memset(tsBo_->map + 16ull * tsBase, 0, 16 * cmds.size());
     for (size_t k = 0; k < cmds.size(); k++) {
         Cmd& c = buf[k];
         memset(&c, 0, sizeof c);
@@ -358,10 +387,12 @@ bool DrmDevice::submit(uint32_t queue, const std::vector<ComputeCommand>& cmds, 
         c.c.helper.binary = cmds[k].helperBinary;
         c.c.helper.cfg = cmds[k].helperCfg;
         c.c.helper.data = cmds[k].helperData;
-        c.c.ts.start.handle = tsObject_;
-        c.c.ts.start.offset = (uint32_t)(16 * k);
-        c.c.ts.end.handle = tsObject_;
-        c.c.ts.end.offset = (uint32_t)(16 * k + 8);
+        if (tsBase) {
+            c.c.ts.start.handle = tsObject_;
+            c.c.ts.start.offset = (uint32_t)(16 * (tsBase + k));
+            c.c.ts.end.handle = tsObject_;
+            c.c.ts.end.offset = (uint32_t)(16 * (tsBase + k) + 8);
+        }
     }
     drm_asahi_sync syncs[2]{};
     uint32_t nin = 0;
@@ -374,26 +405,21 @@ bool DrmDevice::submit(uint32_t queue, const std::vector<ComputeCommand>& cmds, 
     syncs[nin].handle = outSync;
     drm_asahi_submit sub{};
     sub.syncs = (uint64_t)(uintptr_t)syncs;
-    sub.cmdbuf = (uint64_t)(uintptr_t)buf.data();
+    sub.cmdbuf = (uint64_t)(uintptr_t)buf;
     sub.queue_id = queue;
     sub.in_sync_count = nin;
     sub.out_sync_count = 1;
-    sub.cmdbuf_size = (uint32_t)(sizeof(Cmd) * buf.size());
+    sub.cmdbuf_size = (uint32_t)(sizeof(Cmd) * cmds.size());
     if (xioctl(fd_, DRM_IOCTL_ASAHI_SUBMIT, &sub) != 0) {
         error = "DRM_IOCTL_ASAHI_SUBMIT failed: " + std::string(strerror(errno));
         return false;
     }
-    if (tsOut) {
-        // Timestamps are written when the commands finish: the caller reads
-        // them after the wait, from the same slots (we hold tsMutex_ until
-        // the wait below completes).
+    if (wait) {
         int r = waitSyncobj(outSync, 10ull * 1000000000ull);
         if (r != 0) {
             error = r == ETIME ? "GPU timeout (10 s): the command did not finish" : "syncobj wait failed: " + std::string(strerror(r));
             return false;
         }
-        tsOut->resize(cmds.size());
-        for (size_t k = 0; k < cmds.size(); k++) memcpy(&(*tsOut)[k], tsBo_->map + 16 * k, 16);
     }
     return true;
 }

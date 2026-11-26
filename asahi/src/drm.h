@@ -76,10 +76,15 @@ public:
     void destroyQueue(uint32_t queue);
 
     // Submits up to maxCommandsPerSubmission compute commands as one submission.
-    // inSync (0 = none) is waited for; outSync is signalled. Timestamps (start,
-    // end ticks) of each command land in tsOut when non-null.
+    // inSync (0 = none) is waited for; outSync is signalled. Command k writes its
+    // (start, end) timestamps to slot tsBase + k (a range from allocTimestamps).
+    // With wait, returns once outSync signals (error on a 10 s timeout).
     bool submit(uint32_t queue, const std::vector<ComputeCommand>& cmds, uint32_t inSync, uint32_t outSync,
-                std::vector<std::pair<uint64_t, uint64_t>>* tsOut, std::string& error);
+                uint32_t tsBase, bool wait, std::string& error);
+    // Timestamp slots: a range of n (0 when none is free), its (start, end) ticks.
+    uint32_t allocTimestamps(uint32_t n);
+    void freeTimestamps(uint32_t base, uint32_t n);
+    std::pair<uint64_t, uint64_t> timestamp(uint32_t slot) const;
     uint32_t createSyncobj();
     void destroySyncobj(uint32_t h);
     // Returns 0 on success, ETIME on timeout, another errno on failure.
@@ -101,6 +106,7 @@ private:
     Bo* tsBo_ = nullptr;
     uint32_t tsObject_ = 0;
     std::mutex tsMutex_;
+    std::vector<std::pair<uint32_t, uint32_t>> tsFree_; // free slot ranges (base, count)
 };
 
 } // namespace masahi

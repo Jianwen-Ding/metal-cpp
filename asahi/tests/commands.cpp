@@ -2,6 +2,7 @@
 #include "harness.h"
 
 #include <atomic>
+#include <mutex>
 #include <thread>
 
 static MTL::ComputePipelineState* addOne()
@@ -195,6 +196,61 @@ TEST(many_command_buffers_in_flight)
         CHECK(t::data<uint32_t>(bufs[i])[n - 1] == n - 1);
         bufs[i]->release();
     }
+}
+
+TEST(pipelined_dependent_command_buffers)
+{
+    // 64 command buffers in flight, each adding one to the same buffer; every 16th
+    // also blits a snapshot (the CPU copy must see the GPU work of the ones before).
+    // Completed handlers run in commit order.
+    const int k = 64;
+    const uint32_t n = 2048;
+    std::vector<float> zero(n, 0.0f), one(n, 1.0f);
+    MTL::Buffer *acc = t::buffer(zero), *ones = t::buffer(one);
+    std::vector<MTL::Buffer*> snaps;
+    std::vector<MTL::CommandBuffer*> cbs;
+    std::vector<int> order;
+    std::mutex om;
+    for (int i = 0; i < k; i++) {
+        MTL::CommandBuffer* cb = t::queue()->commandBuffer();
+        MTL::ComputeCommandEncoder* e = cb->computeCommandEncoder();
+        e->setComputePipelineState(t::pipeline("basic.air", "vadd"));
+        e->setBuffer(acc, 0, 0);
+        e->setBuffer(ones, 0, 1);
+        e->setBuffer(acc, 0, 2);
+        e->setBytes(&n, 4, 3);
+        e->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+        e->endEncoding();
+        if (i % 16 == 15) {
+            MTL::Buffer* s = t::zeros(n * 4);
+            MTL::BlitCommandEncoder* b = cb->blitCommandEncoder();
+            b->copyFromBuffer(acc, 0, s, 0, n * 4);
+            b->endEncoding();
+            snaps.push_back(s);
+        }
+        cb->addCompletedHandler([&order, &om, i](MTL::CommandBuffer*) {
+            std::lock_guard<std::mutex> l(om);
+            order.push_back(i);
+        });
+        cb->commit();
+        cbs.push_back(cb);
+    }
+    cbs.back()->waitUntilCompleted();
+    for (int i = 0; i < k; i++) CHECK(cbs[i]->status() == MTL::CommandBufferStatusCompleted);
+    {
+        std::lock_guard<std::mutex> l(om);
+        CHECK(order.size() == (size_t)k);
+        for (int i = 0; i < k; i++) CHECK_MSG(order[i] == i, "handler %d ran as %d", i, order[i]);
+    }
+    for (uint32_t j = 0; j < n; j++) CHECK(t::data<float>(acc)[j] == (float)k);
+    for (size_t s = 0; s < snaps.size(); s++) {
+        for (uint32_t j = 0; j < n; j++) CHECK_MSG(t::data<float>(snaps[s])[j] == 16.0f * (s + 1), "snapshot %zu", s);
+        snaps[s]->release();
+    }
+    // GPU intervals are ordered: each starts after the one before it started.
+    for (int i = 1; i < k; i++) CHECK(cbs[i]->GPUStartTime() >= cbs[i - 1]->GPUStartTime());
+    acc->release();
+    ones->release();
 }
 
 TEST(two_queues)
